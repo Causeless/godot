@@ -73,6 +73,12 @@ String EditorPropertyNameProcessor::_capitalize_name(const String &p_name) const
 	}
 
 	Vector<String> parts = p_name.split("_", false);
+
+	// Single letter prefixes (like m_ for member variables) are not included in the name
+	if (parts.size() > 0 && parts[0].length() == 1) {
+		parts.write[0] = "";
+	}
+
 	for (int i = 0; i < parts.size(); i++) {
 		// Articles/conjunctions/prepositions which should only be capitalized when not at beginning and end.
 		if (i > 0 && i + 1 < parts.size() && stop_words.has(parts[i])) {
