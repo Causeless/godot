@@ -1440,7 +1440,12 @@ void GDScriptAnalyzer::resolve_class_body(GDScriptParser::ClassNode *p_class, co
 		GDScriptParser::ClassNode::Member member = p_class->members[i];
 		if (member.type == GDScriptParser::ClassNode::Member::VARIABLE) {
 #ifdef DEBUG_ENABLED
-			if (member.variable->usages == 0 && String(member.variable->identifier->name).begins_with("_")) {
+			String name_as_string(member.variable->identifier->name);
+			if (name_as_string.unicode_at(0) != '_' && name_as_string.unicode_at(1) != '_')  {
+				parser->push_warning(member.variable->identifier, GDScriptWarning::UNPREFIXED_MEMBER, member.variable->identifier->name);
+			}
+
+			if (member.variable->usages == 0 && name_as_string.begins_with("_")) {
 				parser->push_warning(member.variable->identifier, GDScriptWarning::UNUSED_PRIVATE_CLASS_VARIABLE, member.variable->identifier->name);
 			}
 #endif
