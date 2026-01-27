@@ -4340,8 +4340,6 @@ void TileMapLayerEditor::_draw_overlay() {
 			Color grid_color = EDITOR_GET("editors/tiles_editor/grid_color");
 			for (int x = displayed_rect.position.x; x < (displayed_rect.position.x + displayed_rect.size.x); x++) {
 				for (int y = displayed_rect.position.y; y < (displayed_rect.position.y + displayed_rect.size.y); y++) {
-					Vector2i pos_in_rect = Vector2i(x, y) - displayed_rect.position;
-
 					Transform2D tile_xform;
 					tile_xform.set_origin(tile_set->map_to_local(Vector2(x, y)));
 					tile_xform.set_scale(tile_shape_size);
