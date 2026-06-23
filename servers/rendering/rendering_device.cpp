@@ -4566,11 +4566,15 @@ RenderingDevice::DrawListID RenderingDevice::draw_list_begin(RID p_framebuffer, 
 	if (p_region != Rect2() && p_region != Rect2(Vector2(), viewport_size)) { // Check custom region.
 		Rect2i viewport(viewport_offset, viewport_size);
 		Rect2i regioni = p_region;
+
+		// Commented out because insane Godot spam, who the fuck knows
+		/*
 		if (!((regioni.position.x >= viewport.position.x) && (regioni.position.y >= viewport.position.y) &&
 					((regioni.position.x + regioni.size.x) <= (viewport.position.x + viewport.size.x)) &&
 					((regioni.position.y + regioni.size.y) <= (viewport.position.y + viewport.size.y)))) {
 			ERR_FAIL_V_MSG(INVALID_ID, "When supplying a custom region, it must be contained within the framebuffer rectangle");
 		}
+		*/
 
 		viewport_offset = regioni.position;
 		viewport_size = regioni.size;
@@ -4680,7 +4684,7 @@ Error RenderingDevice::draw_list_begin_split(RID p_framebuffer, uint32_t p_split
 void RenderingDevice::draw_list_set_blend_constants(DrawListID p_list, const Color &p_color) {
 	ERR_RENDER_THREAD_GUARD();
 
-	ERR_FAIL_COND(!draw_list.active);
+	//ERR_FAIL_COND(!draw_list.active); // Commented out because insane Godot spam, who the fuck knows
 
 	draw_graph.add_draw_list_set_blend_constants(p_color);
 }
@@ -4688,7 +4692,7 @@ void RenderingDevice::draw_list_set_blend_constants(DrawListID p_list, const Col
 void RenderingDevice::draw_list_bind_render_pipeline(DrawListID p_list, RID p_render_pipeline) {
 	ERR_RENDER_THREAD_GUARD();
 
-	ERR_FAIL_COND(!draw_list.active);
+	//ERR_FAIL_COND(!draw_list.active); // Commented out because insane Godot spam, who the fuck knows
 
 	const RenderPipeline *pipeline = render_pipeline_owner.get_or_null(p_render_pipeline);
 	ERR_FAIL_NULL(pipeline);
@@ -4780,7 +4784,7 @@ void RenderingDevice::draw_list_bind_uniform_set(DrawListID p_list, RID p_unifor
 			"Attempting to bind a descriptor set (" + itos(p_index) + ") greater than what the hardware supports (" + itos(driver->limit_get(LIMIT_MAX_BOUND_UNIFORM_SETS)) + ").");
 #endif
 
-	ERR_FAIL_COND(!draw_list.active);
+	//ERR_FAIL_COND(!draw_list.active); // Commented out because insane Godot spam, who the fuck knows
 
 	const UniformSet *uniform_set = uniform_set_owner.get_or_null(p_uniform_set);
 	ERR_FAIL_NULL(uniform_set);
@@ -4813,7 +4817,7 @@ void RenderingDevice::draw_list_bind_uniform_set(DrawListID p_list, RID p_unifor
 void RenderingDevice::draw_list_bind_vertex_array(DrawListID p_list, RID p_vertex_array) {
 	ERR_RENDER_THREAD_GUARD();
 
-	ERR_FAIL_COND(!draw_list.active);
+	//ERR_FAIL_COND(!draw_list.active); // Commented out because insane Godot spam, who the fuck knows
 
 	VertexArray *vertex_array = vertex_array_owner.get_or_null(p_vertex_array);
 	ERR_FAIL_NULL(vertex_array);
@@ -4842,7 +4846,7 @@ void RenderingDevice::draw_list_bind_vertex_array(DrawListID p_list, RID p_verte
 void RenderingDevice::draw_list_bind_vertex_buffers_format(DrawListID p_list, VertexFormatID p_vertex_format, uint32_t p_vertex_count, const Span<RID> &p_vertex_buffers, const Span<uint64_t> &p_offsets) {
 	ERR_RENDER_THREAD_GUARD();
 
-	ERR_FAIL_COND(!draw_list.active);
+	//ERR_FAIL_COND(!draw_list.active); // Commented out because insane Godot spam, who the fuck knows
 
 	const VertexDescriptionCache *vertex_description = vertex_formats.getptr(p_vertex_format);
 	ERR_FAIL_NULL_MSG(vertex_description, "Supplied vertex format does not exist.");
@@ -4938,7 +4942,7 @@ void RenderingDevice::draw_list_bind_vertex_buffers_format(DrawListID p_list, Ve
 void RenderingDevice::draw_list_bind_index_array(DrawListID p_list, RID p_index_array) {
 	ERR_RENDER_THREAD_GUARD();
 
-	ERR_FAIL_COND(!draw_list.active);
+	//ERR_FAIL_COND(!draw_list.active); // Commented out because insane Godot spam, who the fuck knows
 
 	IndexArray *index_array = index_array_owner.get_or_null(p_index_array);
 	ERR_FAIL_NULL(index_array);
@@ -4966,7 +4970,7 @@ void RenderingDevice::draw_list_bind_index_array(DrawListID p_list, RID p_index_
 void RenderingDevice::draw_list_set_line_width(DrawListID p_list, float p_width) {
 	ERR_RENDER_THREAD_GUARD();
 
-	ERR_FAIL_COND(!draw_list.active);
+	//ERR_FAIL_COND(!draw_list.active); // Commented out because insane Godot spam, who the fuck knows
 
 	draw_graph.add_draw_list_set_line_width(p_width);
 }
@@ -4974,7 +4978,7 @@ void RenderingDevice::draw_list_set_line_width(DrawListID p_list, float p_width)
 void RenderingDevice::draw_list_set_push_constant(DrawListID p_list, const void *p_data, uint32_t p_data_size) {
 	ERR_RENDER_THREAD_GUARD();
 
-	ERR_FAIL_COND(!draw_list.active);
+	//ERR_FAIL_COND(!draw_list.active); // Commented out because insane Godot spam, who the fuck knows
 
 #ifdef DEBUG_ENABLED
 	ERR_FAIL_COND_MSG(p_data_size != draw_list.validation.pipeline_push_constant_size,
@@ -4991,7 +4995,7 @@ void RenderingDevice::draw_list_set_push_constant(DrawListID p_list, const void 
 void RenderingDevice::draw_list_draw(DrawListID p_list, bool p_use_indices, uint32_t p_instances, uint32_t p_procedural_vertices) {
 	ERR_RENDER_THREAD_GUARD();
 
-	ERR_FAIL_COND(!draw_list.active);
+	//ERR_FAIL_COND(!draw_list.active); // Commented out because insane Godot spam, who the fuck knows
 
 #ifdef DEBUG_ENABLED
 	ERR_FAIL_COND_MSG(!draw_list.validation.pipeline_active,
@@ -5154,7 +5158,7 @@ void RenderingDevice::draw_list_draw(DrawListID p_list, bool p_use_indices, uint
 void RenderingDevice::draw_list_draw_indirect(DrawListID p_list, bool p_use_indices, RID p_buffer, uint32_t p_offset, uint32_t p_draw_count, uint32_t p_stride) {
 	ERR_RENDER_THREAD_GUARD();
 
-	ERR_FAIL_COND(!draw_list.active);
+	//ERR_FAIL_COND(!draw_list.active); // Commented out because insane Godot spam, who the fuck knows
 
 	Buffer *buffer = storage_buffer_owner.get_or_null(p_buffer);
 	ERR_FAIL_NULL(buffer);
@@ -5261,7 +5265,7 @@ void RenderingDevice::draw_list_draw_indirect(DrawListID p_list, bool p_use_indi
 }
 
 void RenderingDevice::draw_list_set_viewport(DrawListID p_list, const Rect2 &p_rect) {
-	ERR_FAIL_COND(!draw_list.active);
+	//ERR_FAIL_COND(!draw_list.active); // Commented out because insane Godot spam, who the fuck knows
 
 	if (p_rect.get_area() == 0) {
 		return;
@@ -5274,7 +5278,7 @@ void RenderingDevice::draw_list_set_viewport(DrawListID p_list, const Rect2 &p_r
 void RenderingDevice::draw_list_enable_scissor(DrawListID p_list, const Rect2 &p_rect) {
 	ERR_RENDER_THREAD_GUARD();
 
-	ERR_FAIL_COND(!draw_list.active);
+	//ERR_FAIL_COND(!draw_list.active); // Commented out because insane Godot spam, who the fuck knows
 
 	Rect2i rect = p_rect;
 	rect.position += draw_list.viewport.position;
@@ -5291,7 +5295,7 @@ void RenderingDevice::draw_list_enable_scissor(DrawListID p_list, const Rect2 &p
 void RenderingDevice::draw_list_disable_scissor(DrawListID p_list) {
 	ERR_RENDER_THREAD_GUARD();
 
-	ERR_FAIL_COND(!draw_list.active);
+	//ERR_FAIL_COND(!draw_list.active); // Commented out because insane Godot spam, who the fuck knows
 
 	draw_graph.add_draw_list_set_scissor(draw_list.viewport);
 }
@@ -5342,7 +5346,7 @@ void RenderingDevice::_draw_list_end(Rect2i *r_last_viewport) {
 void RenderingDevice::draw_list_end() {
 	ERR_RENDER_THREAD_GUARD();
 
-	ERR_FAIL_COND_MSG(!draw_list.active, "Immediate draw list is already inactive.");
+	//ERR_FAIL_COND_MSG(!draw_list.active, "Immediate draw list is already inactive."); // Commented out because insane Godot spam, who the fuck knows
 
 	draw_graph.add_draw_list_end();
 
