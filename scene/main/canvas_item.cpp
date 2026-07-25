@@ -1082,7 +1082,7 @@ void CanvasItem::_notify_transform(CanvasItem *p_node) {
 	if (p_node->notify_transform && !p_node->xform_change.in_list()) {
 		if (!p_node->block_transform_notify) {
 			if (p_node->is_inside_tree()) {
-				if (is_accessible_from_caller_thread()) {
+				if (Thread::is_main_thread()) {
 					get_tree()->xform_change_list.add(&p_node->xform_change);
 				} else {
 					// Should be rare, but still needs to be handled.
