@@ -388,6 +388,7 @@ public:
 	void tick();
 	void update_interpolation_tick(bool p_process = true);
 	void set_physics_interpolation_enabled(bool p_enabled) { _interpolation_data.interpolation_enabled = p_enabled; }
+	void set_physics_interpolation_fraction(double p_fraction) { _interpolation_data.interpolation_fraction = p_fraction; }
 
 	struct InterpolationData {
 		void notify_free_canvas_item(RID p_rid, RendererCanvasCull::Item &r_canvas_item);
@@ -407,6 +408,11 @@ public:
 		LocalVector<RID> *canvas_light_occluder_transform_update_list_prev = &canvas_light_occluder_transform_update_lists[1];
 
 		bool interpolation_enabled = false;
+
+		// Fraction of the frame currently being drawn, set at the start of each draw.
+		// Use this instead of Engine::get_physics_interpolation_fraction() when rendering,
+		// as with a separate render thread the main thread may already have changed it for the next frame.
+		double interpolation_fraction = 0.0;
 	} _interpolation_data;
 
 	RendererCanvasCull();

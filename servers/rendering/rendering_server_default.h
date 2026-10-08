@@ -85,7 +85,7 @@ class RenderingServerDefault : public RenderingServer {
 	void _thread_exit();
 	void _thread_loop();
 
-	void _draw(bool p_swap_buffers, double frame_step);
+	void _draw(bool p_swap_buffers, double frame_step, double p_interpolation_fraction);
 	void _run_post_draw_steps();
 	void _init();
 	void _finish();
@@ -93,6 +93,10 @@ class RenderingServerDefault : public RenderingServer {
 	void _free(RID p_rid);
 
 	void _call_on_render_thread(const Callable &p_callable);
+
+	void _set_physics_interpolation_enabled(bool p_enabled);
+	void _tick();
+	void _pre_draw(bool p_will_draw);
 
 public:
 	//if editor is redrawing when it shouldn't, enable this and put a breakpoint in _changes_changed()

@@ -30,6 +30,7 @@
 
 #include "rendering_server_default.h"
 
+#include "core/config/engine.h"
 #include "core/os/os.h"
 #include "core/profiling/profiling.h"
 #include "renderer_canvas_cull.h"
@@ -66,9 +67,12 @@ void RenderingServerDefault::request_frame_drawn_callback(const Callable &p_call
 	frame_drawn_callbacks.push_back(p_callable);
 }
 
-void RenderingServerDefault::_draw(bool p_swap_buffers, double frame_step) {
+void RenderingServerDefault::_draw(bool p_swap_buffers, double frame_step, double p_interpolation_fraction) {
 	GodotProfileZoneGroupedFirst(_profile_zone, "rasterizer->begin_frame");
 	RSG::rasterizer->begin_frame(frame_step);
+
+	// Interpolate using the fraction of the frame being drawn, which was captured on the main thread in draw().
+	RSG::canvas->set_physics_interpolation_fraction(p_interpolation_fraction);
 
 	TIMESTAMP_BEGIN()
 
@@ -419,6 +423,15 @@ void RenderingServerDefault::_thread_loop() {
 /* INTERPOLATION */
 
 void RenderingServerDefault::set_physics_interpolation_enabled(bool p_enabled) {
+	if (Thread::get_caller_id() != server_thread) {
+		command_queue.push(this, &RenderingServerDefault::_set_physics_interpolation_enabled, p_enabled);
+	} else {
+		command_queue.flush_if_pending();
+		_set_physics_interpolation_enabled(p_enabled);
+	}
+}
+
+void RenderingServerDefault::_set_physics_interpolation_enabled(bool p_enabled) {
 	RSG::canvas->set_physics_interpolation_enabled(p_enabled);
 	RSG::scene->set_physics_interpolation_enabled(p_enabled);
 }
@@ -438,19 +451,45 @@ void RenderingServerDefault::draw(bool p_present, double frame_step) {
 	// Needs to be done before changes is reset to 0, to not force the editor to redraw.
 	RS::get_singleton()->emit_signal(SNAME("frame_pre_draw"));
 	changes = 0;
+	// Capture the interpolation fraction now, as with a separate render thread the main thread
+	// can start the next frame (and update the fraction) while this frame is still being drawn.
+	const double interpolation_fraction = Engine::get_singleton()->get_physics_interpolation_fraction();
 	if (create_thread) {
-		command_queue.push(this, &RenderingServerDefault::_draw, p_present, frame_step);
+		command_queue.push(this, &RenderingServerDefault::_draw, p_present, frame_step, interpolation_fraction);
 	} else {
-		_draw(p_present, frame_step);
+		_draw(p_present, frame_step, interpolation_fraction);
 	}
 }
 
 void RenderingServerDefault::tick() {
+	// The tick moves the current interpolation transforms to previous, so it must be processed in order with
+	// the transform updates in the command queue. When called directly while the render thread is behind
+	// (e.g. still drawing the previous frame), it would run before the previous tick's transforms are applied,
+	// and race with the render thread reading the interpolation data.
+	if (Thread::get_caller_id() != server_thread) {
+		command_queue.push(this, &RenderingServerDefault::_tick);
+	} else {
+		command_queue.flush_if_pending();
+		_tick();
+	}
+}
+
+void RenderingServerDefault::_tick() {
 	RSG::canvas->tick();
 	RSG::scene->tick();
 }
 
 void RenderingServerDefault::pre_draw(bool p_will_draw) {
+	// Like tick(), this must be processed in order with the queued commands.
+	if (Thread::get_caller_id() != server_thread) {
+		command_queue.push(this, &RenderingServerDefault::_pre_draw, p_will_draw);
+	} else {
+		command_queue.flush_if_pending();
+		_pre_draw(p_will_draw);
+	}
+}
+
+void RenderingServerDefault::_pre_draw(bool p_will_draw) {
 	RSG::scene->pre_draw(p_will_draw);
 }
 
