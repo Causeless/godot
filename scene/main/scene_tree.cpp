@@ -241,6 +241,12 @@ void SceneTree::_accessibility_force_update() {
 }
 
 void SceneTree::_accessibility_notify_change(const Node *p_node, bool p_remove) {
+	// Dirty hack: the change queue isn't thread-safe, and visibility changes made from other threads
+	// reach it. Drop updates from other threads, at the cost of accessibility updates for those changes.
+	if (!Thread::is_main_thread()) {
+		return;
+	}
+
 	if (p_node) {
 		if (p_remove) {
 			accessibility_change_queue.erase(p_node->get_instance_id());
