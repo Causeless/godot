@@ -30,6 +30,9 @@
 
 #include "editor_zoom_widget.h"
 
+#include "core/input/input.h"
+#include "core/object/callable_mp.h"
+#include "core/object/class_db.h"
 #include "core/os/keyboard.h"
 #include "core/string/translation_server.h"
 #include "editor/settings/editor_settings.h"
@@ -53,9 +56,15 @@ void EditorZoomWidget::_update_zoom_label() {
 	zoom_reset->set_text(zoom_text);
 }
 
-void EditorZoomWidget::_button_zoom_minus() {
-	set_zoom_by_increments(-6, Input::get_singleton()->is_key_pressed(Key::ALT));
+void EditorZoomWidget::_button_zoom_by(int p_direction) {
+	bool by_integer = Input::get_singleton()->is_key_pressed(Key::ALT);
+	// Integer mode steps one scaling factor at a time.
+	set_zoom_by_increments(p_direction * (by_integer ? 1 : 6), by_integer);
 	emit_signal(SNAME("zoom_changed"), zoom);
+}
+
+void EditorZoomWidget::_button_zoom_minus() {
+	_button_zoom_by(-1);
 }
 
 void EditorZoomWidget::_button_zoom_reset() {
@@ -64,8 +73,7 @@ void EditorZoomWidget::_button_zoom_reset() {
 }
 
 void EditorZoomWidget::_button_zoom_plus() {
-	set_zoom_by_increments(6, Input::get_singleton()->is_key_pressed(Key::ALT));
-	emit_signal(SNAME("zoom_changed"), zoom);
+	_button_zoom_by(1);
 }
 
 float EditorZoomWidget::get_zoom() {

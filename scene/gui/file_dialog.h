@@ -154,6 +154,9 @@ public:
 		CUSTOMIZATION_LAYOUT,
 		CUSTOMIZATION_OVERWRITE_WARNING,
 		CUSTOMIZATION_DELETE,
+		CUSTOMIZATION_NAVIGATION_BUTTONS,
+		CUSTOMIZATION_DRIVE_SELECTOR,
+		CUSTOMIZATION_FILTERS,
 		CUSTOMIZATION_MAX
 	};
 
@@ -199,12 +202,12 @@ private:
 	Vector<String> local_history;
 	int local_history_pos = 0;
 
-	bool mode_overrides_title = true;
 	String root_subfolder;
 	String root_prefix;
 	String full_dir;
 
 	bool is_invalidating = false;
+	bool ensure_visible_after_invalidating = false;
 
 	VBoxContainer *main_vbox = nullptr;
 
@@ -213,7 +216,8 @@ private:
 	Button *dir_up = nullptr;
 
 	HBoxContainer *drives_container = nullptr;
-	OptionButton *drives = nullptr;
+	MenuButton *drives = nullptr;
+	int selected_drive = 0;
 	LineEdit *directory_edit = nullptr;
 	HBoxContainer *shortcuts_container = nullptr;
 
@@ -279,6 +283,13 @@ private:
 		Ref<Texture2D> favorite_down;
 		Ref<Texture2D> file_thumbnail;
 		Ref<Texture2D> folder_thumbnail;
+
+		Ref<Texture2D> menu_copy_path;
+		Ref<Texture2D> menu_delete;
+		Ref<Texture2D> menu_refresh;
+		Ref<Texture2D> menu_new_folder;
+		Ref<Texture2D> menu_show_in_file_manager;
+		Ref<Texture2D> menu_open_bundle;
 
 		Color folder_icon_color;
 		Color file_icon_color;
@@ -435,8 +446,10 @@ public:
 	void set_root_subfolder(const String &p_root);
 	String get_root_subfolder() const;
 
-	void set_mode_overrides_title(bool p_override);
-	bool is_mode_overriding_title() const;
+#ifndef DISABLE_DEPRECATED
+	void set_mode_overrides_title(bool p_override) {}
+	bool is_mode_overriding_title() const { return true; }
+#endif
 
 	void set_use_native_dialog(bool p_native);
 	bool get_use_native_dialog() const;

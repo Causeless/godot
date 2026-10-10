@@ -31,7 +31,7 @@
 #pragma once
 
 #include "core/object/script_language.h"
-#include "core/os/os.h"
+#include "core/os/process_id.h"
 #include "editor/debugger/editor_debugger_inspector.h"
 #include "editor/debugger/editor_debugger_node.h"
 #include "scene/gui/margin_container.h"
@@ -83,7 +83,11 @@ private:
 		ACTION_DELETE_ALL_BREAKPOINTS,
 	};
 
-	AcceptDialog *msgdialog = nullptr;
+	enum VMemMenu {
+		VMEM_MENU_SHOW_IN_FILESYSTEM,
+		VMEM_MENU_SHOW_IN_EXPLORER,
+		VMEM_MENU_OWNERS,
+	};
 
 	LineEdit *clicked_ctrl = nullptr;
 	LineEdit *clicked_ctrl_type = nullptr;
@@ -109,8 +113,8 @@ private:
 	};
 	FileDialogPurpose file_dialog_purpose = SAVE_MONITORS_CSV;
 
-	int error_count;
-	int warning_count;
+	int error_count = 0;
+	int warning_count = 0;
 
 	bool skip_breakpoints_value = false;
 	bool ignore_error_breaks_value = false;
@@ -134,11 +138,13 @@ private:
 
 	HashMap<int, String> profiler_signature;
 
+	MarginContainer *vmem_mc = nullptr;
 	Tree *vmem_tree = nullptr;
 	Button *vmem_refresh = nullptr;
 	Button *vmem_export = nullptr;
 	LineEdit *vmem_total = nullptr;
 	TextureRect *vmem_notice_icon = nullptr;
+	PopupMenu *vmem_item_menu = nullptr;
 
 	Tree *stack_dump = nullptr;
 	LineEdit *search = nullptr;
@@ -157,7 +163,7 @@ private:
 	EditorPerformanceProfiler *performance_profiler = nullptr;
 	EditorExpressionEvaluator *expression_evaluator = nullptr;
 
-	OS::ProcessID remote_pid = 0;
+	ProcessID remote_pid = 0;
 	bool move_to_foreground = true;
 	bool can_request_idle_draw = false;
 
@@ -190,7 +196,7 @@ private:
 	void _mute_audio_on_break(bool p_mute);
 	void _send_debug_mute_audio_msg(bool p_mute);
 
-	EditorDebuggerNode::CameraOverride camera_override;
+	EditorDebuggerNode::CameraOverride camera_override = EditorDebuggerNode::OVERRIDE_NONE;
 
 	void _stack_dump_frame_selected();
 
@@ -229,13 +235,12 @@ private:
 	void _msg_remote_objects_selected(uint64_t p_thread_id, const Array &p_data);
 	void _msg_remote_nothing_selected(uint64_t p_thread_id, const Array &p_data);
 	void _msg_remote_selection_invalidated(uint64_t p_thread_id, const Array &p_data);
-	void _msg_show_selection_limit_warning(uint64_t p_thread_id, const Array &p_data);
+	void _msg_remote_undo_redo_action(uint64_t p_thread_id, const Array &p_data);
 	void _msg_performance_profile_names(uint64_t p_thread_id, const Array &p_data);
 	void _msg_filesystem_update_file(uint64_t p_thread_id, const Array &p_data);
 	void _msg_evaluation_return(uint64_t p_thread_id, const Array &p_data);
 	void _msg_window_title(uint64_t p_thread_id, const Array &p_data);
-	void _msg_embed_suspend_toggle(uint64_t p_thread_id, const Array &p_data);
-	void _msg_embed_next_frame(uint64_t p_thread_id, const Array &p_data);
+	void _msg_editor_shortcut_pressed(uint64_t p_thread_id, const Array &p_data);
 
 	void _parse_message(const String &p_msg, uint64_t p_thread_id, const Array &p_data);
 	void _set_reason_text(const String &p_reason, MessageType p_type);
@@ -267,6 +272,8 @@ private:
 	void _collapse_errors_list();
 
 	void _vmem_item_activated();
+	void _vmem_tree_rmb_selected(const Vector2 &p_pos, MouseButton p_button);
+	void _vmem_item_menu_id_pressed(int p_option);
 
 	void _profiler_activate(bool p_enable, int p_profiler);
 	void _profiler_seeked();
@@ -298,13 +305,9 @@ protected:
 	static void _bind_methods();
 
 public:
-	enum EmbedShortcutAction {
-		EMBED_SUSPEND_TOGGLE,
-		EMBED_NEXT_FRAME,
-	};
-
 	void request_remote_objects(const TypedArray<uint64_t> &p_obj_ids, bool p_update_selection = true);
 	void update_remote_object(ObjectID p_obj_id, const String &p_prop, const Variant &p_value, const String &p_field = "");
+	void change_canvas_item_objects(const Dictionary &p_states);
 
 	void clear_inspector(bool p_send_msg = true);
 
@@ -345,6 +348,7 @@ public:
 	bool request_stack_dump(const int &p_frame);
 
 	void update_tabs();
+	void add_style();
 	void clear_style();
 	String get_var_value(const String &p_var) const;
 
@@ -361,6 +365,8 @@ public:
 
 	bool get_debug_mute_audio() const;
 	void set_debug_mute_audio(bool p_mute);
+
+	void set_debug_collisions(bool p_enable);
 
 	EditorDebuggerNode::CameraOverride get_camera_override() const;
 	void set_camera_override(EditorDebuggerNode::CameraOverride p_override);
@@ -384,6 +390,8 @@ public:
 
 	void send_message(const String &p_message, const Array &p_args);
 	void toggle_profiler(const String &p_profiler, bool p_enable, const Array &p_data);
+
+	void update_layout(EditorDock::DockLayout p_layout, int p_slot);
 
 	ScriptEditorDebugger();
 	~ScriptEditorDebugger();

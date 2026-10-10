@@ -31,10 +31,17 @@
 #include "openxr_visibility_mask_extension.h"
 
 #include "../openxr_api.h"
+
 #include "core/string/print_string.h"
 #include "core/variant/array.h"
 #include "core/variant/variant.h"
 #include "servers/rendering/rendering_server.h"
+
+// Note: if foveated inset rendering is used, our visibility mask should only
+// be applied to our context view.
+// This code is correct and will only supply data for the primary view.
+// But user will need to setup visual layers accordingly.
+// Need to document this!
 
 static const char *VISIBILITY_MASK_SHADER_CODE =
 		"shader_type spatial;\n"
@@ -101,7 +108,7 @@ void OpenXRVisibilityMaskExtension::on_session_created(const XrSession p_instanc
 		rendering_server->material_set_render_priority(material, 99);
 
 		// Get our initial mesh data.
-		mesh_count = openxr_api->get_view_count(); // We need a mesh for each view.
+		mesh_count = openxr_api->get_view_count(); // We need a mesh for each primary view.
 		for (uint32_t i = 0; i < mesh_count; i++) {
 			_update_mesh_data(i);
 		}
@@ -277,12 +284,12 @@ void OpenXRVisibilityMaskExtension::_update_mesh() {
 
 		// Update our mesh.
 		Array arr;
-		arr.resize(RS::ARRAY_MAX);
-		arr[RS::ARRAY_VERTEX] = vertices;
-		arr[RS::ARRAY_INDEX] = indices;
+		arr.resize(RSE::ARRAY_MAX);
+		arr[RSE::ARRAY_VERTEX] = vertices;
+		arr[RSE::ARRAY_INDEX] = indices;
 
 		rendering_server->mesh_clear(mesh);
-		rendering_server->mesh_add_surface_from_arrays(mesh, RS::PRIMITIVE_TRIANGLES, arr);
+		rendering_server->mesh_add_surface_from_arrays(mesh, RSE::PRIMITIVE_TRIANGLES, arr);
 		rendering_server->mesh_surface_set_material(mesh, 0, material);
 
 		// Set no longer dirty.

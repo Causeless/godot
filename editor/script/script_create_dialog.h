@@ -34,7 +34,6 @@
 #include "scene/gui/check_box.h"
 #include "scene/gui/dialogs.h"
 #include "scene/gui/option_button.h"
-#include "scene/gui/panel_container.h"
 
 class CreateDialog;
 class EditorFileDialog;
@@ -80,6 +79,7 @@ class ScriptCreateDialog : public ConfirmationDialog {
 	bool load_enabled = true;
 	int default_language;
 	bool re_check_path = false;
+	bool missing_base_dir = false;
 
 	Control *path_controls[2];
 	Control *name_controls[2];

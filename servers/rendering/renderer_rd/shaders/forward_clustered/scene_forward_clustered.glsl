@@ -6,7 +6,6 @@
 
 /* Include half precision types. */
 #include "../half_inc.glsl"
-
 #include "scene_forward_clustered_inc.glsl"
 
 #define SHADER_IS_SRGB false
@@ -396,14 +395,14 @@ void vertex_shader(vec3 vertex_input,
 	vertex = (model_matrix * vec4(vertex, 1.0)).xyz;
 
 #ifdef NORMAL_USED
+	// For correct non-uniform scale handling, normal has to be transformed by normal matrix, but tangent vectors need to use model matrix as is
 	normal_highp = model_normal_matrix * normal_highp;
 #endif
 
 #ifdef TANGENT_USED
-
-	tangent = model_normal_matrix * tangent;
-	binormal = model_normal_matrix * binormal;
-
+	// For non-uniform scale, this produces non-orthogonal TBNs; ideally binormal should be reconstructed in fragment shader with cross
+	tangent = mat3(model_matrix) * tangent;
+	binormal = mat3(model_matrix) * binormal;
 #endif
 #endif
 
@@ -461,13 +460,14 @@ void vertex_shader(vec3 vertex_input,
 	vertex = (modelview * vec4(vertex, 1.0)).xyz;
 
 #ifdef NORMAL_USED
+	// For correct non-uniform scale handling, normal has to be transformed by normal matrix, but tangent vectors need to use model matrix as is
 	normal = modelview_normal * normal;
 #endif
 
 #ifdef TANGENT_USED
-
-	binormal = modelview_normal * binormal;
-	tangent = modelview_normal * tangent;
+	// For non-uniform scale, this produces non-orthogonal TBNs; ideally binormal should be reconstructed in fragment shader with cross
+	tangent = mat3(modelview) * tangent;
+	binormal = mat3(modelview) * binormal;
 #endif
 #endif // !defined(SKIP_TRANSFORM_USED) && !defined(VERTEX_WORLD_COORDS_USED)
 
@@ -487,8 +487,7 @@ void vertex_shader(vec3 vertex_input,
 
 	vertex_interp = vertex;
 
-	// Normalize TBN vectors before interpolation, per MikkTSpace.
-	// See: http://www.mikktspace.com/
+	// Normalize TBN vectors to account for model/normal transforms that may have scale
 #ifdef NORMAL_USED
 	normal_interp = normalize(normal);
 #endif
@@ -877,10 +876,28 @@ void main() {
 
 /* Include half precision types. */
 #include "../half_inc.glsl"
-
 #include "scene_forward_clustered_inc.glsl"
 
 /* Varyings */
+
+#if defined(TEXTURE_STREAMING) && !defined(MODE_RENDER_DEPTH) && (defined(UV_USED) || defined(STREAMING_LOD_USED))
+// Since material feedback writes to a ssbo buffer, early fragment tests likely get disabled by the
+// driver so unless we want really bad performance, we need to force enable it again.
+//
+// To Early-Z, or Not To Early-Z
+//  - https://therealmjp.github.io/posts/to-earlyz-or-not-to-earlyz/#uavsstorage-texturesstorage-buffers
+#if defined(ALPHA_SCISSOR_USED) || defined(ALPHA_HASH_USED) || defined(ENABLE_CLIP_ALPHA) || defined(UBERSHADER) || defined(DISCARD_USED)
+#define TEXTURE_STREAMING_MAY_DISCARD
+#endif
+
+#if defined(DEPTH_TEST_DISABLED_USED) || defined(DEPTH_DRAW_NEVER_USED) || (defined(TEXTURE_STREAMING_DEPTH_PREPASS) && !defined(DEPTH_DRAW_ALWAYS_USED))
+#define TEXTURE_STREAMING_NO_DEPTH_WRITE
+#endif
+
+#if !defined(DEPTH_USED) && (!defined(TEXTURE_STREAMING_MAY_DISCARD) || (defined(TEXTURE_STREAMING_NO_DEPTH_WRITE) && !defined(STENCIL_WRITE_USED)))
+layout(early_fragment_tests) in;
+#endif
+#endif // TEXTURE_STREAMING
 
 layout(location = 0) in vec3 vertex_interp;
 
@@ -894,6 +911,12 @@ layout(location = 2) in vec4 color_interp;
 
 #ifdef UV_USED
 layout(location = 3) in vec2 uv_interp;
+#endif
+
+#include "../scene_forward_streaming_inc.glsl"
+
+#ifdef STREAMING_LOD_USED
+float streaming_lod = 32.0; // Defaults to value past the coursest quality.
 #endif
 
 #if defined(UV2_USED) || defined(USE_LIGHTMAP)
@@ -919,64 +942,7 @@ layout(location = 9) in float dp_clip;
 layout(location = 10) in flat uint instance_index_interp;
 
 #ifdef USE_LIGHTMAP
-// w0, w1, w2, and w3 are the four cubic B-spline basis functions
-float w0(float a) {
-	return (1.0 / 6.0) * (a * (a * (-a + 3.0) - 3.0) + 1.0);
-}
-
-float w1(float a) {
-	return (1.0 / 6.0) * (a * a * (3.0 * a - 6.0) + 4.0);
-}
-
-float w2(float a) {
-	return (1.0 / 6.0) * (a * (a * (-3.0 * a + 3.0) + 3.0) + 1.0);
-}
-
-float w3(float a) {
-	return (1.0 / 6.0) * (a * a * a);
-}
-
-// g0 and g1 are the two amplitude functions
-float g0(float a) {
-	return w0(a) + w1(a);
-}
-
-float g1(float a) {
-	return w2(a) + w3(a);
-}
-
-// h0 and h1 are the two offset functions
-float h0(float a) {
-	return -1.0 + w1(a) / (w0(a) + w1(a));
-}
-
-float h1(float a) {
-	return 1.0 + w3(a) / (w2(a) + w3(a));
-}
-
-vec4 textureArray_bicubic(texture2DArray tex, vec3 uv, vec2 texture_size) {
-	vec2 texel_size = vec2(1.0) / texture_size;
-
-	uv.xy = uv.xy * texture_size + vec2(0.5);
-
-	vec2 iuv = floor(uv.xy);
-	vec2 fuv = fract(uv.xy);
-
-	float g0x = g0(fuv.x);
-	float g1x = g1(fuv.x);
-	float h0x = h0(fuv.x);
-	float h1x = h1(fuv.x);
-	float h0y = h0(fuv.y);
-	float h1y = h1(fuv.y);
-
-	vec2 p0 = (vec2(iuv.x + h0x, iuv.y + h0y) - vec2(0.5)) * texel_size;
-	vec2 p1 = (vec2(iuv.x + h1x, iuv.y + h0y) - vec2(0.5)) * texel_size;
-	vec2 p2 = (vec2(iuv.x + h0x, iuv.y + h1y) - vec2(0.5)) * texel_size;
-	vec2 p3 = (vec2(iuv.x + h1x, iuv.y + h1y) - vec2(0.5)) * texel_size;
-
-	return (g0(fuv.y) * (g0x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p0, uv.z)) + g1x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p1, uv.z)))) +
-			(g1(fuv.y) * (g0x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p2, uv.z)) + g1x * texture(sampler2DArray(tex, SAMPLER_LINEAR_CLAMP), vec3(p3, uv.z))));
-}
+#include "../bicubic_filter_inc.glsl"
 #endif //USE_LIGHTMAP
 
 #ifdef USE_MULTIVIEW
@@ -1080,9 +1046,8 @@ layout(location = 2) out vec2 motion_vector;
 #define SPECULAR_SCHLICK_GGX
 #endif
 
-#include "../scene_forward_lights_inc.glsl"
-
 #include "../scene_forward_gi_inc.glsl"
+#include "../scene_forward_lights_inc.glsl"
 
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
 
@@ -1091,7 +1056,7 @@ layout(location = 2) out vec2 motion_vector;
 vec4 volumetric_fog_process(vec2 screen_uv, float z) {
 	vec3 fog_pos = vec3(screen_uv, z * implementation_data.volumetric_fog_inv_length);
 	if (fog_pos.z < 0.0) {
-		return vec4(0.0);
+		return vec4(0.0, 0.0, 0.0, 1.0);
 	} else if (fog_pos.z < 1.0) {
 		fog_pos.z = pow(fog_pos.z, implementation_data.volumetric_fog_detail_spread);
 	}
@@ -1394,6 +1359,45 @@ void fragment_shader(in SceneData scene_data) {
 #endif // MODE_RENDER_MATERIAL
 #endif // ALPHA_SCISSOR_USED
 
+#if defined(UV_USED) || defined(STREAMING_LOD_USED)
+#if defined(TEXTURE_STREAMING)
+#if !defined(MODE_RENDER_DEPTH)
+	if (sc_material_feedback()) {
+		// Instance has materials which require feedback.
+#if !defined(STREAMING_LOD_USED)
+		vec2 uv_ddx = dFdx(uv_interp);
+		vec2 uv_ddy = dFdy(uv_interp);
+#endif
+
+		if (!gl_HelperInvocation) {
+#if defined(STREAMING_LOD_USED)
+			// The shader supplied the level itself.
+			float footprint_sq = streaming_footprint_sq_from_lod(streaming_lod);
+#else
+			// Calculate the mip level needed for the current fragment based on UV derivatives.
+			float footprint_sq = streaming_footprint_sq(uv_ddx, uv_ddy);
+#endif
+
+			// Bitwise NOT inverts the ordering so that smaller footprint_sq (higher quality)
+			// maps to larger uint values, allowing atomicMax with a 0-cleared buffer.
+			uint required_mip = ~floatBitsToUint(footprint_sq);
+
+			// Reduce atomic contention using subgroup operations.
+			// Find maximum inverted mip level across all invocations in the subgroup, then only
+			// one invocation performs the atomic write.
+			// Right now this assumes all invocations will have the same instance index.
+			// If that is not true then probably need a subgroupAllEqual check first + fallback.
+			uint subgroup_max_mip = subgroupMax(required_mip);
+			if (subgroupElect()) {
+				const uint material_feedback_index = instances.data[instance_index].material_feedback_index;
+				atomicMax(material_feedback.data[material_feedback_index], subgroup_max_mip);
+			}
+		}
+	}
+#endif // MODE_RENDER_DEPTH
+#endif // TEXTURE_STREAMING
+#endif // UV_USED || STREAMING_LOD_USED
+
 // alpha hash can be used in unison with alpha antialiasing
 #ifdef ALPHA_HASH_USED
 	vec3 object_pos = (inverse(read_model_matrix) * inv_view_matrix * vec4(vertex, 1.0)).xyz;
@@ -1505,10 +1509,18 @@ void fragment_shader(in SceneData scene_data) {
 		vec4 res = vec4(0.0);
 		if (bool(scene_data.flags & SCENE_DATA_FLAGS_USE_FOG)) {
 			//must use the full blending equation here to blend fogs
-			res.a = fog.a * volumetric_fog.a;
-			res.rgb = fog.rgb * volumetric_fog.a + volumetric_fog.rgb;
+			if (sc_fog_use_legacy_blending()) {
+				res.a = mix(0.0, fog.a, volumetric_fog.a);
+				res.rgb = mix(volumetric_fog.rgb, fog.rgb, volumetric_fog.a);
+			} else {
+				res.a = fog.a * volumetric_fog.a;
+				res.rgb = fog.rgb * volumetric_fog.a + volumetric_fog.rgb;
+			}
 		} else {
 			res = volumetric_fog;
+			if (sc_fog_use_legacy_blending()) {
+				res.rgb *= 1.0 - res.a;
+			}
 		}
 		fog = res;
 	}
@@ -1543,7 +1555,7 @@ void fragment_shader(in SceneData scene_data) {
 
 	{ // process decals
 
-		uint cluster_decal_offset = cluster_offset + implementation_data.cluster_type_size * 2;
+		uint cluster_decal_offset = cluster_offset + implementation_data.cluster_type_size * 3;
 
 		uint item_min;
 		uint item_max;
@@ -1722,6 +1734,8 @@ void fragment_shader(in SceneData scene_data) {
 		indirect_specular_light *= scene_data.IBL_exposure_normalization;
 		indirect_specular_light *= horizon * horizon;
 		indirect_specular_light *= scene_data.ambient_light_color_energy.a;
+	} else if (bool(scene_data.flags & SCENE_DATA_FLAGS_USE_REFLECTION_COLOR)) {
+		indirect_specular_light = scene_data.reflection_color.rgb;
 	}
 
 #if defined(CUSTOM_RADIANCE_USED)
@@ -1754,37 +1768,34 @@ void fragment_shader(in SceneData scene_data) {
 #endif
 
 #ifdef LIGHT_CLEARCOAT_USED
+	vec3 cc_specular_light = vec3(0.0);
+	vec3 cc_ref_vec = vec3(0.0);
 
 	if (bool(scene_data.flags & SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP)) {
-		float NoV = max(dot(geo_normal, view), 0.0001); // We want to use geometric normal, not normal_map
-		vec3 ref_vec = reflect(-view, geo_normal);
-		ref_vec = mix(ref_vec, geo_normal, clearcoat_roughness * clearcoat_roughness);
-		// The clear coat layer assumes an IOR of 1.5 (4% reflectance)
-		float Fc = clearcoat * (0.04 + 0.96 * SchlickFresnel(NoV));
-		float attenuation = 1.0 - Fc;
-		ambient_light *= attenuation;
-		indirect_specular_light *= attenuation;
+		cc_ref_vec = reflect(-view, geo_normal);
+		cc_ref_vec = mix(cc_ref_vec, geo_normal, mix(0.001, 0.1, clearcoat_roughness));
 
-		float horizon = min(1.0 + dot(ref_vec, indirect_normal), 1.0);
-		ref_vec = scene_data.radiance_inverse_xform * ref_vec;
-		float roughness_lod = mix(0.001, 0.1, sqrt(clearcoat_roughness)) * MAX_ROUGHNESS_LOD;
+		vec3 cc_radiance_ref_vec = scene_data.radiance_inverse_xform * cc_ref_vec;
+		float roughness_lod = sqrt(mix(0.001, 0.1, clearcoat_roughness)) * MAX_ROUGHNESS_LOD;
 #ifdef USE_RADIANCE_OCTMAP_ARRAY
 
 		float lod, blend;
 		blend = modf(roughness_lod, lod);
 
-		float ref_lod = vec3_to_oct_lod(dFdx(ref_vec), dFdy(ref_vec), scene_data_block.data.radiance_pixel_size);
-		vec2 ref_uv = vec3_to_oct_with_border(ref_vec, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
+		float ref_lod = vec3_to_oct_lod(dFdx(cc_radiance_ref_vec), dFdy(cc_radiance_ref_vec), scene_data_block.data.radiance_pixel_size);
+		vec2 ref_uv = vec3_to_oct_with_border(cc_radiance_ref_vec, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
 		vec3 clearcoat_sample_a = textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(ref_uv, lod), ref_lod).rgb;
 		vec3 clearcoat_sample_b = textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(ref_uv, lod + 1), ref_lod).rgb;
 		vec3 clearcoat_light = mix(clearcoat_sample_a, clearcoat_sample_b, blend);
 
 #else
-		vec2 ref_uv = vec3_to_oct_with_border(ref_vec, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
+		vec2 ref_uv = vec3_to_oct_with_border(cc_radiance_ref_vec, vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0));
 		vec3 clearcoat_light = textureLod(sampler2D(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), ref_uv, roughness_lod).rgb;
 
 #endif //USE_RADIANCE_OCTMAP_ARRAY
-		indirect_specular_light += clearcoat_light * horizon * horizon * Fc * scene_data.ambient_light_color_energy.a;
+		cc_specular_light += clearcoat_light * scene_data.IBL_exposure_normalization * scene_data.ambient_light_color_energy.a;
+	} else if (bool(scene_data.flags & SCENE_DATA_FLAGS_USE_REFLECTION_COLOR)) {
+		cc_specular_light = scene_data.reflection_color.rgb;
 	}
 #endif // LIGHT_CLEARCOAT_USED
 #endif // !AMBIENT_LIGHT_DISABLED
@@ -1840,10 +1851,10 @@ void fragment_shader(in SceneData scene_data) {
 			vec3 lm_light_l1p1;
 
 			if (sc_use_lightmap_bicubic_filter()) {
-				lm_light_l0 = textureArray_bicubic(lightmap_textures[ofs], uvw + vec3(0.0, 0.0, 0.0), lightmaps.data[ofs].light_texture_size).rgb;
-				lm_light_l1n1 = (textureArray_bicubic(lightmap_textures[ofs], uvw + vec3(0.0, 0.0, 1.0), lightmaps.data[ofs].light_texture_size).rgb - vec3(0.5)) * 2.0;
-				lm_light_l1_0 = (textureArray_bicubic(lightmap_textures[ofs], uvw + vec3(0.0, 0.0, 2.0), lightmaps.data[ofs].light_texture_size).rgb - vec3(0.5)) * 2.0;
-				lm_light_l1p1 = (textureArray_bicubic(lightmap_textures[ofs], uvw + vec3(0.0, 0.0, 3.0), lightmaps.data[ofs].light_texture_size).rgb - vec3(0.5)) * 2.0;
+				lm_light_l0 = texture_array_bicubic(lightmap_textures[ofs], uvw + vec3(0.0, 0.0, 0.0), lightmaps.data[ofs].light_texture_size).rgb;
+				lm_light_l1n1 = (texture_array_bicubic(lightmap_textures[ofs], uvw + vec3(0.0, 0.0, 1.0), lightmaps.data[ofs].light_texture_size).rgb - vec3(0.5)) * 2.0;
+				lm_light_l1_0 = (texture_array_bicubic(lightmap_textures[ofs], uvw + vec3(0.0, 0.0, 2.0), lightmaps.data[ofs].light_texture_size).rgb - vec3(0.5)) * 2.0;
+				lm_light_l1p1 = (texture_array_bicubic(lightmap_textures[ofs], uvw + vec3(0.0, 0.0, 3.0), lightmaps.data[ofs].light_texture_size).rgb - vec3(0.5)) * 2.0;
 			} else {
 				lm_light_l0 = textureLod(sampler2DArray(lightmap_textures[ofs], SAMPLER_LINEAR_CLAMP), uvw + vec3(0.0, 0.0, 0.0), 0.0).rgb;
 				lm_light_l1n1 = (textureLod(sampler2DArray(lightmap_textures[ofs], SAMPLER_LINEAR_CLAMP), uvw + vec3(0.0, 0.0, 1.0), 0.0).rgb - vec3(0.5)) * 2.0;
@@ -1851,17 +1862,77 @@ void fragment_shader(in SceneData scene_data) {
 				lm_light_l1p1 = (textureLod(sampler2DArray(lightmap_textures[ofs], SAMPLER_LINEAR_CLAMP), uvw + vec3(0.0, 0.0, 3.0), 0.0).rgb - vec3(0.5)) * 2.0;
 			}
 
-			vec3 n = normalize(lightmaps.data[ofs].normal_xform * indirect_normal);
+			mat3 normal_xform = mat3(lightmaps.data[ofs].normal_xform_and_specular_intensity);
+			vec3 n = normalize(normal_xform * indirect_normal);
 			float en = lightmaps.data[ofs].exposure_normalization;
 
-			ambient_light += lm_light_l0 * en;
-			ambient_light += lm_light_l1n1 * n.y * (lm_light_l0 * en * 4.0);
-			ambient_light += lm_light_l1_0 * n.z * (lm_light_l0 * en * 4.0);
-			ambient_light += lm_light_l1p1 * n.x * (lm_light_l0 * en * 4.0);
+			vec3 sh_light = lm_light_l0;
+			sh_light += lm_light_l0 * lm_light_l1n1 * n.y * 4.0;
+			sh_light += lm_light_l0 * lm_light_l1_0 * n.z * 4.0;
+			sh_light += lm_light_l0 * lm_light_l1p1 * n.x * 4.0;
+			sh_light *= lightmaps.data[ofs].exposure_normalization;
+			ambient_light += sh_light;
+
+			if (sc_use_lightmap_specular()) {
+				// fake specular light to create some direct light specular lobes for directional lightmaps.
+				// https://media.contentapi.ea.com/content/dam/eacom/frostbite/files/gdc2018-precomputedgiobalilluminationinfrostbite.pdf (slides 66-71)
+				const vec3 luminance_weights = vec3(0.2126, 0.7152, 0.0722);
+				vec3 l1 = vec3(
+						dot(lm_light_l0 * lm_light_l1p1, luminance_weights),
+						dot(lm_light_l0 * lm_light_l1n1, luminance_weights),
+						dot(lm_light_l0 * lm_light_l1_0, luminance_weights));
+				float l1_len = length(l1);
+				float l0_luminance = dot(lm_light_l0, luminance_weights);
+
+				if (l1_len > 1e-5 && l0_luminance > 1e-5) {
+					vec3 lightmap_direction = l1 / l1_len;
+					vec3 L_view = normalize(lightmap_direction * normal_xform);
+					float NdotL = max(dot(normal, L_view), 0.0);
+
+					if (NdotL > 1e-4) {
+						vec3 specular_lightmap_normal = normalize(normal_xform * normal);
+						vec3 specular_irradiance = lm_light_l0;
+						specular_irradiance += lm_light_l0 * lm_light_l1n1 * specular_lightmap_normal.y * 4.0;
+						specular_irradiance += lm_light_l0 * lm_light_l1_0 * specular_lightmap_normal.z * 4.0;
+						specular_irradiance += lm_light_l0 * lm_light_l1p1 * specular_lightmap_normal.x * 4.0;
+						specular_irradiance *= lightmaps.data[ofs].exposure_normalization;
+						vec3 specular_light_color = max(specular_irradiance, vec3(0.0)) / max(NdotL, 0.1);
+
+						vec3 f0 = F0(metallic, specular, albedo);
+
+						vec3 diffuse_light_discarded = diffuse_light;
+						float directionality = clamp(l1_len / l0_luminance, 0.0, 1.0);
+						float specular_intensity = directionality * lightmaps.data[ofs].normal_xform_and_specular_intensity[0][3] * 2.0;
+
+						light_compute(normal, L_view, view, 0.0, specular_light_color, true, 1.0, f0, roughness, metallic, specular_intensity, albedo, alpha, screen_uv, energy_compensation,
+#ifdef LIGHT_BACKLIGHT_USED
+								backlight,
+#endif
+#ifdef LIGHT_TRANSMITTANCE_USED
+								transmittance_color,
+								transmittance_depth,
+								transmittance_boost,
+								0.0,
+#endif
+#ifdef LIGHT_RIM_USED
+								rim, rim_tint,
+#endif
+#ifdef LIGHT_CLEARCOAT_USED
+								clearcoat, clearcoat_roughness, geo_normal,
+#endif // LIGHT_CLEARCOAT_USED
+#ifdef LIGHT_ANISOTROPY_USED
+								binormal,
+								tangent, anisotropy,
+#endif
+								diffuse_light_discarded,
+								direct_specular_light);
+					}
+				}
+			}
 
 		} else {
 			if (sc_use_lightmap_bicubic_filter()) {
-				ambient_light += textureArray_bicubic(lightmap_textures[ofs], uvw, lightmaps.data[ofs].light_texture_size).rgb * lightmaps.data[ofs].exposure_normalization;
+				ambient_light += texture_array_bicubic(lightmap_textures[ofs], uvw, lightmaps.data[ofs].light_texture_size).rgb * lightmaps.data[ofs].exposure_normalization;
 			} else {
 				ambient_light += textureLod(sampler2DArray(lightmap_textures[ofs], SAMPLER_LINEAR_CLAMP), uvw, 0.0).rgb * lightmaps.data[ofs].exposure_normalization;
 			}
@@ -2036,8 +2107,11 @@ void fragment_shader(in SceneData scene_data) {
 
 		vec4 reflection_accum = vec4(0.0, 0.0, 0.0, 0.0);
 		vec4 ambient_accum = vec4(0.0, 0.0, 0.0, 0.0);
+#ifdef LIGHT_CLEARCOAT_USED
+		vec4 cc_reflection_accum = vec4(0.0, 0.0, 0.0, 0.0);
+#endif
 
-		uint cluster_reflection_offset = cluster_offset + implementation_data.cluster_type_size * 3;
+		uint cluster_reflection_offset = cluster_offset + implementation_data.cluster_type_size * 4;
 
 		uint item_min;
 		uint item_max;
@@ -2081,11 +2155,21 @@ void fragment_shader(in SceneData scene_data) {
 					continue; //not masked
 				}
 
+#ifndef LIGHT_CLEARCOAT_USED
 				if (reflection_accum.a >= 1.0 && ambient_accum.a >= 1.0) {
 					break;
 				}
+#else
+				if (reflection_accum.a >= 1.0 && cc_reflection_accum.a >= 1.0 && ambient_accum.a >= 1.0) {
+					break;
+				}
+#endif // LIGHT_CLEARCOAT_USED
 
-				reflection_process(reflection_index, vertex, ref_vec, normal, roughness, ambient_light, indirect_specular_light, ambient_accum, reflection_accum);
+				reflection_process(reflection_index, vertex, ref_vec, normal, roughness, ambient_light,
+#ifdef LIGHT_CLEARCOAT_USED
+						cc_ref_vec, mix(0.001, 0.1, clearcoat_roughness), cc_reflection_accum,
+#endif
+						ambient_accum, reflection_accum);
 			}
 		}
 
@@ -2097,9 +2181,21 @@ void fragment_shader(in SceneData scene_data) {
 			reflection_accum.rgb = indirect_specular_light * (1.0 - reflection_accum.a) + reflection_accum.rgb;
 		}
 
+#ifdef LIGHT_CLEARCOAT_USED
+		if (cc_reflection_accum.a < 1.0) {
+			cc_reflection_accum.rgb = cc_specular_light * (1.0 - cc_reflection_accum.a) + cc_reflection_accum.rgb;
+		}
+#endif
+
 		if (reflection_accum.a > 0.0) {
 			indirect_specular_light = reflection_accum.rgb;
 		}
+
+#ifdef LIGHT_CLEARCOAT_USED
+		if (cc_reflection_accum.a > 0.0) {
+			cc_specular_light = cc_reflection_accum.rgb;
+		}
+#endif
 
 #if !defined(USE_LIGHTMAP)
 		if (ambient_accum.a > 0.0) {
@@ -2110,7 +2206,20 @@ void fragment_shader(in SceneData scene_data) {
 
 	//finalize ambient light here
 	{
+#ifdef MULTI_BOUNCE_OCCLUSION_ENABLED
+		// Apply multi-bounce ambient-occlusion approximation to ambient light:
+		// https://blog.selfshadow.com/publications/s2016-shading-course/activision/s2016_pbs_activision_occlusion.pdf#page=78
+		{
+			vec3 a = vec3(2.0404) * albedo - vec3(0.3324);
+			vec3 b = vec3(-4.7951) * albedo + vec3(0.6417);
+			vec3 c = vec3(2.7552) * albedo + vec3(0.6903);
+			vec3 x = vec3(ao);
+			vec3 bounce_occlusion = max(x, ((x * a + b) * x + c) * x);
+			ambient_light *= bounce_occlusion;
+		}
+#else // MULTI_BOUNCE_OCCLUSION_ENABLED
 		ambient_light *= ao;
+#endif // MULTI_BOUNCE_OCCLUSION_ENABLED
 #ifndef SPECULAR_OCCLUSION_DISABLED
 #ifdef BENT_NORMAL_MAP_USED
 		// Apply cone to cone intersection with cosine weighted assumption:
@@ -2206,6 +2315,15 @@ void fragment_shader(in SceneData scene_data) {
 
 	//this saves some VGPRs
 	vec3 f0 = F0(metallic, specular, albedo);
+
+#ifdef LIGHT_CLEARCOAT_USED
+	// The base layer's f0 is computed assuming an interface from air to an IOR
+	// of 1.5, but the clear coat layer forms an interface from IOR 1.5 to IOR
+	// 1.5. We recompute f0 by first computing its IOR, then reconverting to f0
+	// by using the correct interface
+	f0 = mix(f0, f0_Clear_Coat_To_Surface(f0), clearcoat);
+#endif
+
 #ifndef AMBIENT_LIGHT_DISABLED
 	{
 #if defined(DIFFUSE_TOON)
@@ -2214,14 +2332,31 @@ void fragment_shader(in SceneData scene_data) {
 #else
 		// Base Layer
 		float NdotV = clamp(dot(normal, view), 0.0001, 1.0);
-		vec2 envBRDF = prefiltered_dfg(roughness, NdotV).xy;
+		vec2 envBRDF = prefiltered_dfg(roughness, NdotV);
 		// Multiscattering
 		energy_compensation = get_energy_compensation(f0, envBRDF.y);
 
 		// cheap luminance approximation
 		float f90 = clamp(50.0 * f0.g, metallic, 1.0);
 		indirect_specular_light *= energy_compensation * ((f90 - f0) * envBRDF.x + f0 * envBRDF.y);
+
+#ifdef LIGHT_CLEARCOAT_USED
+		float geo_NdotV = max(dot(geo_normal, view), 0.0001); // We want to use geometric normal, not normal_map
+		// The clearcoat layer assumes an IOR of 1.5 (4% reflectance).
+		// Attenuate underlying diffuse/specular by clearcoat fresnel (ONLY fresnel, hence we don't just invert the BRDF below).
+		float NdotV5 = SchlickFresnel(geo_NdotV);
+		float F = mix(0.04, 1.0, NdotV5) * clearcoat;
+		float cc_attenuation = 1.0 - F;
+
+		ambient_light *= cc_attenuation;
+		indirect_specular_light *= cc_attenuation;
+
+		// Clearcoat Layer
+		// We don't need DFG for clearcoat, so we can use the fresnel directly.
+		indirect_specular_light += cc_specular_light * F;
 #endif
+
+#endif // DIFFUSE_TOON
 	}
 
 #endif // !AMBIENT_LIGHT_DISABLED
@@ -2257,7 +2392,7 @@ void fragment_shader(in SceneData scene_data) {
 				const vec3 uvw = vec3(scaled_uv, float(slice));
 
 				if (sc_use_lightmap_bicubic_filter()) {
-					shadowmask = textureArray_bicubic(lightmap_textures[MAX_LIGHTMAP_TEXTURES + ofs], uvw, lightmaps.data[ofs].light_texture_size).x;
+					shadowmask = texture_array_bicubic(lightmap_textures[MAX_LIGHTMAP_TEXTURES + ofs], uvw, lightmaps.data[ofs].light_texture_size).x;
 				} else {
 					shadowmask = textureLod(sampler2DArray(lightmap_textures[MAX_LIGHTMAP_TEXTURES + ofs], SAMPLER_LINEAR_CLAMP), uvw, 0.0).x;
 				}
@@ -2292,10 +2427,10 @@ void fragment_shader(in SceneData scene_data) {
 					vec3 light_dir = directional_lights.data[i].direction;
 					vec3 base_normal_bias = geo_normal * (1.0 - max(0.0, dot(light_dir, -geo_normal)));
 
-#define BIAS_FUNC(m_var, m_idx)                                                                 \
-	m_var.xyz += light_dir * directional_lights.data[i].shadow_bias[m_idx];                     \
+#define BIAS_FUNC(m_var, m_idx) \
+	m_var.xyz += light_dir * directional_lights.data[i].shadow_bias[m_idx]; \
 	vec3 normal_bias = base_normal_bias * directional_lights.data[i].shadow_normal_bias[m_idx]; \
-	normal_bias -= light_dir * dot(light_dir, normal_bias);                                     \
+	normal_bias -= light_dir * dot(light_dir, normal_bias); \
 	m_var.xyz += normal_bias;
 
 					//version with soft shadows, more expensive
@@ -2369,7 +2504,7 @@ void fragment_shader(in SceneData scene_data) {
 							blend_count++;
 						}
 
-						if (blend_count < blend_max) {
+						if (blend_count < blend_max && depth_z < directional_lights.data[i].shadow_split_offsets.w) {
 							vec4 v = vec4(vertex, 1.0);
 
 							BIAS_FUNC(v, 3)
@@ -2489,6 +2624,18 @@ void fragment_shader(in SceneData scene_data) {
 #endif
 
 #undef BIAS_FUNC
+
+					//process sscs
+					if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_SSCS) && directional_lights.data[i].sscs_index != 0xFFFFFFFF) {
+#ifdef USE_MULTIVIEW
+						float sscs_layer = float(directional_lights.data[i].sscs_index * 2u + uint(ViewIndex));
+#else
+					float sscs_layer = float(directional_lights.data[i].sscs_index);
+#endif // USE_MULTIVIEW
+						float sscs_shadow = textureLod(sampler2DArray(sscs_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, sscs_layer), 0.0).r;
+
+						shadow = min(shadow, sscs_shadow);
+					}
 				} // shadows
 
 				if (i < 4) {
@@ -2755,6 +2902,67 @@ void fragment_shader(in SceneData scene_data) {
 #ifdef LIGHT_CLEARCOAT_USED
 						clearcoat, clearcoat_roughness, geo_normal,
 #endif // LIGHT_CLEARCOAT_USED
+#ifdef LIGHT_ANISOTROPY_USED
+						binormal, tangent, anisotropy,
+#endif
+						diffuse_light, direct_specular_light);
+			}
+		}
+	}
+
+	if (sc_cluster_has_area_light()) { // area lights
+
+		uint cluster_area_offset = cluster_offset + implementation_data.cluster_type_size * 2;
+
+		uint item_min;
+		uint item_max;
+		uint item_from;
+		uint item_to;
+
+		cluster_get_item_range(cluster_area_offset + implementation_data.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
+
+		item_from = subgroupBroadcastFirst(subgroupMin(item_from));
+		item_to = subgroupBroadcastFirst(subgroupMax(item_to));
+
+		for (uint i = item_from; i < item_to; i++) {
+			uint mask = cluster_buffer.data[cluster_area_offset + i];
+			mask &= cluster_get_range_clip_mask(i, item_min, item_max);
+
+			uint merged_mask = subgroupBroadcastFirst(subgroupOr(mask));
+			while (merged_mask != 0) {
+				uint bit = findMSB(merged_mask);
+				merged_mask &= ~(1u << bit);
+
+				if (((1u << bit) & mask) == 0) { //do not process if not originally here
+					continue;
+				}
+
+				uint light_index = 32 * i + bit;
+
+				if (!bool(area_lights.data[light_index].mask & instances.data[instance_index].layer_mask)) {
+					continue; //not masked
+				}
+
+				if (area_lights.data[light_index].bake_mode == LIGHT_BAKE_STATIC && bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_LIGHTMAP)) {
+					continue; // Statically baked light and object uses lightmap, skip
+				}
+
+				light_process_area(light_index, vertex, view, normal, vertex_ddx, vertex_ddy, f0, roughness, metallic, scene_data.taa_frame_count, albedo, alpha, screen_uv, energy_compensation,
+#ifdef LIGHT_BACKLIGHT_USED
+						backlight,
+#endif
+#ifdef LIGHT_TRANSMITTANCE_USED
+						transmittance_color,
+						transmittance_depth,
+						transmittance_boost,
+#endif
+#ifdef LIGHT_RIM_USED
+						rim,
+						rim_tint,
+#endif
+#ifdef LIGHT_CLEARCOAT_USED
+						clearcoat, clearcoat_roughness, geo_normal,
+#endif
 #ifdef LIGHT_ANISOTROPY_USED
 						binormal, tangent, anisotropy,
 #endif

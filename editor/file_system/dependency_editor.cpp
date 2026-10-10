@@ -33,6 +33,9 @@
 #include "core/config/project_settings.h"
 #include "core/io/file_access.h"
 #include "core/io/resource_loader.h"
+#include "core/object/callable_mp.h"
+#include "core/os/os.h"
+#include "editor/docks/filesystem_dock.h"
 #include "editor/editor_node.h"
 #include "editor/editor_string_names.h"
 #include "editor/file_system/editor_file_system.h"
@@ -42,7 +45,9 @@
 #include "editor/themes/editor_scale.h"
 #include "scene/gui/box_container.h"
 #include "scene/gui/item_list.h"
+#include "scene/gui/line_edit.h"
 #include "scene/gui/margin_container.h"
+#include "scene/gui/menu_button.h"
 #include "scene/gui/popup_menu.h"
 #include "scene/gui/tree.h"
 
@@ -60,6 +65,34 @@ static void _setup_search_file_dialog(EditorFileDialog *p_dialog, const String &
 	}
 }
 
+struct DependencyEditorSortByType {
+	bool operator()(const String &p_a, const String &p_b) const {
+		const String a_type = p_a.contains("::") ? p_a.get_slice("::", 1) : "Resource";
+		const String b_type = p_b.contains("::") ? p_b.get_slice("::", 1) : "Resource";
+		const String a_path = p_a.contains("::") ? p_a.get_slice("::", 2) : p_a;
+		const String b_path = p_b.contains("::") ? p_b.get_slice("::", 2) : p_b;
+		return a_type == b_type ? a_path < b_path : a_type < b_type;
+	}
+};
+
+struct DependencyEditorSortByPath {
+	bool operator()(const String &p_a, const String &p_b) const {
+		const String a_path = p_a.contains("::") ? p_a.get_slice("::", 2) : p_a;
+		const String b_path = p_b.contains("::") ? p_b.get_slice("::", 2) : p_b;
+		return a_path < b_path;
+	}
+};
+
+struct DependencyEditorSortByFile {
+	bool operator()(const String &p_a, const String &p_b) const {
+		const String a_path = p_a.contains("::") ? p_a.get_slice("::", 2) : p_a;
+		const String b_path = p_b.contains("::") ? p_b.get_slice("::", 2) : p_b;
+		const String a_file = a_path.get_file();
+		const String b_file = b_path.get_file();
+		return a_file == b_file ? a_path < b_path : a_file < b_file;
+	}
+};
+
 void DependencyEditor::_searched(const String &p_path) {
 	HashMap<String, String> dep_rename;
 	dep_rename[replacing] = p_path;
@@ -75,7 +108,7 @@ void DependencyEditor::_load_pressed(Object *p_item, int p_cell, int p_button, M
 		return;
 	}
 	TreeItem *ti = Object::cast_to<TreeItem>(p_item);
-	replacing = ti->get_text(1);
+	replacing = ti->get_text((int)Column::PATH);
 
 	_setup_search_file_dialog(search, replacing, ti->get_metadata(0));
 	search->popup_file_dialog();
@@ -176,6 +209,8 @@ void DependencyEditor::_update_file() {
 void DependencyEditor::_notification(int p_what) {
 	if (p_what == NOTIFICATION_THEME_CHANGED) {
 		warning_label->add_theme_color_override(SceneStringName(font_color), get_theme_color("warning_color", EditorStringName(Editor)));
+		filter->set_right_icon(get_editor_theme_icon(SNAME("Search")));
+		menu_sort->set_button_icon(get_editor_theme_icon(SNAME("Sort")));
 	}
 }
 
@@ -203,9 +238,56 @@ static String _get_stored_dep_path(const String &p_dep) {
 	return p_dep.get_slice("::", 0);
 }
 
+List<String> DependencyEditor::_filter_deps(const List<String> &p_deps) {
+	const String filter_text = filter->get_text();
+
+	if (filter_text.is_empty()) {
+		return List<String>(p_deps);
+	}
+
+	List<String> filtered;
+
+	for (const String &item : p_deps) {
+		const String path = item.contains("::") ? item.get_slice("::", 2) : item;
+
+		if (path.containsn(filter_text)) {
+			filtered.push_back(item);
+		}
+	}
+
+	return filtered;
+}
+
 void DependencyEditor::_update_list() {
 	List<String> deps;
 	ResourceLoader::get_dependencies(editing, &deps, true);
+	deps = _filter_deps(deps);
+
+	switch (sort_by) {
+		case DependencyEditorSortBy::TYPE:
+			deps.sort_custom<DependencyEditorSortByType>();
+			break;
+		case DependencyEditorSortBy::TYPE_REVERSE:
+			deps.sort_custom<DependencyEditorSortByType>();
+			deps.reverse();
+			break;
+		case DependencyEditorSortBy::PATH:
+			deps.sort_custom<DependencyEditorSortByPath>();
+			break;
+		case DependencyEditorSortBy::PATH_REVERSE:
+			deps.sort_custom<DependencyEditorSortByPath>();
+			deps.reverse();
+			break;
+		case DependencyEditorSortBy::NAME:
+			deps.sort_custom<DependencyEditorSortByFile>();
+			break;
+		case DependencyEditorSortBy::NAME_REVERSE:
+			deps.sort_custom<DependencyEditorSortByFile>();
+			deps.reverse();
+			break;
+		default:
+			break;
+	}
 
 	tree->clear();
 	missing.clear();
@@ -221,23 +303,26 @@ void DependencyEditor::_update_list() {
 
 		const String path = _get_resolved_dep_path(dep);
 		if (FileAccess::exists(path)) {
-			item->set_text(0, path.get_file());
-			item->set_text(1, path);
+			item->set_text((int)Column::NAME, path.get_file());
+			item->set_text((int)Column::PATH, path);
 		} else {
 			const String &stored_path = _get_stored_dep_path(dep);
-			item->set_text(0, stored_path.get_file());
-			item->set_text(1, stored_path);
-			item->set_custom_color(1, Color(1, 0.4, 0.3));
+			item->set_text((int)Column::NAME, stored_path.get_file());
+			item->set_text((int)Column::PATH, stored_path);
+			item->set_custom_color((int)Column::PATH, Color(1, 0.4, 0.3));
 			missing.push_back(stored_path);
 			broken = true;
 		}
 
 		const String type = dep.contains("::") ? dep.get_slice("::", 1) : "Resource";
+		String name = path.get_file();
 		Ref<Texture2D> icon = EditorNode::get_singleton()->get_class_icon(type);
-		item->set_icon(0, icon);
+		item->set_icon((int)Column::TYPE, icon);
 		item->set_metadata(0, type);
-
-		item->add_button(1, folder, 0);
+		item->set_text((int)Column::TYPE, type);
+		item->set_text((int)Column::NAME, name);
+		item->set_text((int)Column::PATH, path);
+		item->add_button((int)Column::PATH, folder, 0);
 	}
 
 	fixdeps->set_disabled(!broken);
@@ -247,6 +332,9 @@ void DependencyEditor::edit(const String &p_path) {
 	editing = p_path;
 	set_title(TTR("Dependencies For:") + " " + p_path.get_file());
 
+	filter->set_text("");
+
+	_update_menu_sort();
 	_update_list();
 
 	if (EditorNode::get_singleton()->is_scene_open(p_path)) {
@@ -261,21 +349,37 @@ void DependencyEditor::edit(const String &p_path) {
 	popup_centered_ratio(0.4);
 }
 
+void DependencyEditor::_sort_option_selected(int p_id) {
+	sort_by = (DependencyEditorSortBy)p_id;
+	_update_menu_sort();
+	_update_list();
+}
+
+void DependencyEditor::_update_menu_sort() {
+	for (int i = 0; i != (int)DependencyEditorSortBy::MAX; i++) {
+		menu_sort->get_popup()->set_item_checked(i, (i == (int)sort_by));
+	}
+}
+
 DependencyEditor::DependencyEditor() {
 	VBoxContainer *vb = memnew(VBoxContainer);
-	vb->set_name(TTR("Dependencies"));
 	add_child(vb);
 
 	tree = memnew(Tree);
 	tree->set_auto_translate_mode(AUTO_TRANSLATE_MODE_DISABLED);
 	tree->set_theme_type_variation("TreeTable");
 	tree->set_hide_folding(true);
-	tree->set_columns(2);
+	tree->set_columns((int)Column::MAX);
 	tree->set_column_titles_visible(true);
-	tree->set_column_title(0, TTR("Resource"));
-	tree->set_column_clip_content(0, true);
-	tree->set_column_title(1, TTR("Path"));
-	tree->set_column_clip_content(1, true);
+	tree->set_column_title((int)Column::TYPE, TTRC("Type"));
+	tree->set_column_clip_content((int)Column::TYPE, true);
+	tree->set_column_expand_ratio((int)Column::TYPE, 2);
+	tree->set_column_title((int)Column::NAME, TTRC("Name"));
+	tree->set_column_clip_content((int)Column::NAME, true);
+	tree->set_column_expand_ratio((int)Column::NAME, 3);
+	tree->set_column_title((int)Column::PATH, TTRC("Path"));
+	tree->set_column_clip_content((int)Column::PATH, true);
+	tree->set_column_expand_ratio((int)Column::PATH, 5);
 	tree->set_hide_root(true);
 	tree->connect("button_clicked", callable_mp(this, &DependencyEditor::_load_pressed));
 
@@ -290,6 +394,34 @@ DependencyEditor::DependencyEditor() {
 	fixdeps->connect(SceneStringName(pressed), callable_mp(this, &DependencyEditor::_fix_all));
 
 	vb->add_child(hbc);
+
+	HBoxContainer *hbc_filter = memnew(HBoxContainer);
+	vb->add_child(hbc_filter);
+	filter = memnew(LineEdit);
+	filter->set_accessibility_name(TTRC("Filter Dependencies"));
+	filter->set_placeholder(TTRC("Filter Dependencies"));
+	filter->set_clear_button_enabled(true);
+	filter->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	filter->connect(SceneStringName(text_changed), callable_mp(this, &DependencyEditor::_update_list).unbind(1));
+	hbc_filter->add_child(filter);
+
+	menu_sort = memnew(MenuButton);
+	menu_sort->set_flat(false);
+	menu_sort->set_theme_type_variation("FlatMenuButton");
+	menu_sort->set_tooltip_text(TTRC("Sort Dependencies"));
+	menu_sort->set_accessibility_name(TTRC("Sort Dependencies"));
+
+	PopupMenu *popup_sort = menu_sort->get_popup();
+	popup_sort->connect(SceneStringName(id_pressed), callable_mp(this, &DependencyEditor::_sort_option_selected));
+	popup_sort->add_radio_check_item(TTRC("Sort by Type (Ascending)"), (int)DependencyEditorSortBy::TYPE);
+	popup_sort->add_radio_check_item(TTRC("Sort by Type (Descending)"), (int)DependencyEditorSortBy::TYPE_REVERSE);
+	popup_sort->add_radio_check_item(TTRC("Sort by Name (Ascending)"), (int)DependencyEditorSortBy::NAME);
+	popup_sort->add_radio_check_item(TTRC("Sort by Name (Descending)"), (int)DependencyEditorSortBy::NAME_REVERSE);
+	popup_sort->add_radio_check_item(TTRC("Sort by Path (Ascending)"), (int)DependencyEditorSortBy::PATH);
+	popup_sort->add_radio_check_item(TTRC("Sort by Path (Descending)"), (int)DependencyEditorSortBy::PATH_REVERSE);
+	popup_sort->set_item_checked((int)sort_by, true);
+
+	hbc_filter->add_child(menu_sort);
 
 	MarginContainer *mc = memnew(MarginContainer);
 	mc->set_v_size_flags(Control::SIZE_EXPAND_FILL);
@@ -329,7 +461,7 @@ void DependencyEditorOwners::_list_rmb_clicked(int p_item, const Vector2 &p_pos,
 		}
 
 		if (only_scenes_selected) {
-			file_options->add_icon_item(get_editor_theme_icon(SNAME("Load")), TTRN("Open Scene", "Open Scenes", selected_items.size()), FILE_MENU_OPEN);
+			file_options->add_icon_item(get_editor_theme_icon(SNAME("Load")), TPL(selected_items.size(), TTRC("Open Scene"), TTRC("Open Scenes")), FILE_MENU_OPEN);
 		} else if (selected_items.size() == 1) {
 			file_options->add_icon_item(get_editor_theme_icon(SNAME("Load")), TTR("Open"), FILE_MENU_OPEN);
 		} else {
@@ -405,6 +537,14 @@ void DependencyEditorOwners::show(const String &p_path) {
 	editing = p_path;
 	owners->clear();
 	_fill_owners(EditorFileSystem::get_singleton()->get_filesystem());
+
+	for (const StringName &setting : FileSystemDock::get_singleton()->get_path_project_settings()) {
+		const String path = ResourceUID::ensure_path(GLOBAL_GET(setting));
+		if (path == p_path) {
+			owners->add_item(vformat(TTR("Project setting: %s"), setting));
+			owners->set_item_icon(-1, get_editor_theme_icon(SNAME("ClassList")));
+		}
+	}
 
 	int count = owners->get_item_count();
 	if (count > 0) {
@@ -512,6 +652,24 @@ void DependencyRemoveDialog::_find_all_removed_dependencies(EditorFileSystemDire
 	}
 }
 
+void DependencyRemoveDialog::_find_setting_owners_of_removed_files(Vector<RemovedDependency> &p_removed) {
+	for (KeyValue<String, String> &files : all_remove_files) {
+		const String &path = files.key;
+
+		for (const StringName &setting : FileSystemDock::get_singleton()->get_path_project_settings()) {
+			const String setting_path = ResourceUID::ensure_path(GLOBAL_GET(setting));
+			if (setting_path == path) {
+				RemovedDependency dep;
+				dep.file = vformat(TTR("Project setting: %s"), setting);
+				dep.file_type = "ClassList";
+				dep.dependency = path;
+				dep.dependency_folder = files.value;
+				p_removed.push_back(dep);
+			}
+		}
+	}
+}
+
 void DependencyRemoveDialog::_find_localization_remaps_of_removed_files(Vector<RemovedDependency> &p_removed) {
 	for (KeyValue<String, String> &files : all_remove_files) {
 		const String &path = files.key;
@@ -581,10 +739,11 @@ void DependencyRemoveDialog::_build_removed_dependency_tree(const Vector<Removed
 		}
 
 		//List this file under this dependency
-		Ref<Texture2D> icon = EditorNode::get_singleton()->get_class_icon(rd.file_type);
 		TreeItem *file_item = owners->create_item(tree_items[rd.dependency]);
 		file_item->set_text(0, rd.file);
-		file_item->set_icon(0, icon);
+		if (!rd.file_type.is_empty()) {
+			file_item->set_icon(0, EditorNode::get_singleton()->get_class_icon(rd.file_type));
+		}
 	}
 }
 
@@ -622,6 +781,7 @@ void DependencyRemoveDialog::show(const Vector<String> &p_folders, const Vector<
 
 	Vector<RemovedDependency> removed_deps;
 	_find_all_removed_dependencies(EditorFileSystem::get_singleton()->get_filesystem(), removed_deps);
+	_find_setting_owners_of_removed_files(removed_deps);
 	_find_localization_remaps_of_removed_files(removed_deps);
 	removed_deps.sort();
 	if (removed_deps.is_empty()) {
@@ -641,7 +801,7 @@ void DependencyRemoveDialog::show(const Vector<String> &p_folders, const Vector<
 
 void DependencyRemoveDialog::ok_pressed() {
 	HashMap<String, StringName> setting_path_map;
-	for (const StringName &setting : path_project_settings) {
+	for (const StringName &setting : FileSystemDock::get_singleton()->get_path_project_settings()) {
 		const String path = ResourceUID::ensure_path(GLOBAL_GET(setting));
 		setting_path_map[path] = setting;
 	}
@@ -761,7 +921,7 @@ DependencyRemoveDialog::DependencyRemoveDialog() {
 
 	Label *owners_label = memnew(Label);
 	owners_label->set_theme_type_variation("HeaderSmall");
-	owners_label->set_text(TTR("Dependencies of files to be deleted:"));
+	owners_label->set_text(TTR("Owners of files to be deleted:"));
 	vb_owners->add_child(owners_label);
 
 	mc = memnew(MarginContainer);
@@ -774,17 +934,9 @@ DependencyRemoveDialog::DependencyRemoveDialog() {
 	owners->set_scroll_hint_mode(Tree::SCROLL_HINT_MODE_BOTH);
 	owners->set_hide_root(true);
 	owners->set_custom_minimum_size(Size2(0, 94) * EDSCALE);
-	owners->set_accessibility_name(TTRC("Dependencies"));
+	owners->set_accessibility_name(TTRC("Owners"));
 	mc->add_child(owners);
 	owners->set_v_size_flags(Control::SIZE_EXPAND_FILL);
-
-	List<PropertyInfo> property_list;
-	ProjectSettings::get_singleton()->get_property_list(&property_list);
-	for (const PropertyInfo &pi : property_list) {
-		if (pi.type == Variant::STRING && pi.hint == PROPERTY_HINT_FILE) {
-			path_project_settings.push_back(pi.name);
-		}
-	}
 }
 
 //////////////
@@ -902,7 +1054,7 @@ void DependencyErrorDialog::_check_for_resolved() {
 
 				LocalVector<String> &stored_paths = owner_deps[owner_path];
 				for (const String &dep : deps) {
-					if (!errors_fixed && !FileAccess::exists(_get_resolved_dep_path(dep))) {
+					if (errors_fixed && !FileAccess::exists(_get_resolved_dep_path(dep))) {
 						errors_fixed = false;
 					}
 					stored_paths.push_back(_get_stored_dep_path(dep));

@@ -30,9 +30,16 @@
 
 #include "script_editor_debugger.h"
 
+#include "core/config/project_settings.h"
 #include "core/debugger/debugger_marshalls.h"
 #include "core/debugger/remote_debugger.h"
+#include "core/input/input.h"
+#include "core/io/resource_loader.h"
+#include "core/object/callable_mp.h"
+#include "core/object/class_db.h"
+#include "core/os/os.h"
 #include "core/string/ustring.h"
+#include "core/variant/typed_dictionary.h"
 #include "core/version.h"
 #include "editor/debugger/editor_debugger_plugin.h"
 #include "editor/debugger/editor_expression_evaluator.h"
@@ -46,15 +53,15 @@
 #include "editor/editor_string_names.h"
 #include "editor/file_system/editor_file_system.h"
 #include "editor/gui/editor_file_dialog.h"
-#include "editor/gui/editor_toaster.h"
 #include "editor/inspector/editor_property_name_processor.h"
 #include "editor/scene/3d/node_3d_editor_plugin.h"
+#include "editor/scene/3d/node_3d_editor_viewport.h"
 #include "editor/scene/canvas_item_editor_plugin.h"
 #include "editor/settings/editor_settings.h"
 #include "editor/themes/editor_scale.h"
 #include "main/performance.h"
 #include "scene/3d/camera_3d.h"
-#include "scene/debugger/scene_debugger.h"
+#include "scene/debugger/scene_debugger_object.h"
 #include "scene/gui/button.h"
 #include "scene/gui/dialogs.h"
 #include "scene/gui/grid_container.h"
@@ -167,6 +174,10 @@ void ScriptEditorDebugger::update_tabs() {
 			tabs->set_tab_icon(tabs->get_tab_idx_from_control(errors_tab), get_editor_theme_icon(SNAME("Warning")));
 		}
 	}
+}
+
+void ScriptEditorDebugger::add_style() {
+	tabs->add_theme_style_override(SceneStringName(panel), get_theme_stylebox(SNAME("DebuggerPanel"), EditorStringName(EditorStyles)));
 }
 
 void ScriptEditorDebugger::clear_style() {
@@ -287,6 +298,12 @@ void ScriptEditorDebugger::update_remote_object(ObjectID p_obj_id, const String 
 		msg.push_back(p_field);
 		_put_msg("scene:set_object_property_field", msg);
 	}
+}
+
+void ScriptEditorDebugger::change_canvas_item_objects(const Dictionary &p_states) {
+	ERR_FAIL_COND(p_states.is_empty());
+	Array msg = { p_states.duplicate() };
+	_put_msg("scene:change_canvas_item_states", msg);
 }
 
 void ScriptEditorDebugger::request_remote_objects(const TypedArray<uint64_t> &p_obj_ids, bool p_update_selection) {
@@ -445,11 +462,10 @@ void ScriptEditorDebugger::_msg_scene_scene_tree(uint64_t p_thread_id, const Arr
 
 void ScriptEditorDebugger::_msg_scene_inspect_objects(uint64_t p_thread_id, const Array &p_data) {
 	ERR_FAIL_COND(p_data.is_empty());
-	EditorDebuggerRemoteObjects *objs = inspector->set_objects(p_data);
-	if (objs && EditorDebuggerNode::get_singleton()->match_remote_selection(objs->remote_object_ids)) {
+	EditorDebuggerRemoteObjects *robjs = inspector->set_objects(p_data, get_current_debugger_tab());
+	if (robjs && EditorDebuggerNode::get_singleton()->match_remote_selection(robjs->remote_object_ids)) {
 		EditorDebuggerNode::get_singleton()->stop_waiting_inspection();
-
-		emit_signal(SNAME("remote_objects_updated"), objs);
+		emit_signal(SNAME("remote_objects_updated"), robjs);
 	}
 }
 
@@ -490,7 +506,7 @@ void ScriptEditorDebugger::_msg_servers_memory_usage(uint64_t p_thread_id, const
 		// If it does not have a theme icon, just go up the inheritance tree until we find one.
 		if (!has_theme_icon(type, EditorStringName(EditorIcons))) {
 			StringName base_type = type;
-			while (base_type != "Resource" || base_type != "") {
+			while (base_type != "Resource" && base_type != "") {
 				base_type = ClassDB::get_parent_class(base_type);
 				if (has_theme_icon(base_type, EditorStringName(EditorIcons))) {
 					type = base_type;
@@ -576,6 +592,9 @@ void ScriptEditorDebugger::_msg_output(uint64_t p_thread_id, const Array &p_data
 			case RemoteDebugger::MESSAGE_TYPE_ERROR: {
 				msg_type = EditorLog::MSG_TYPE_ERROR;
 			} break;
+			case RemoteDebugger::MESSAGE_TYPE_EDITOR: {
+				msg_type = EditorLog::MSG_TYPE_EDITOR;
+			} break;
 			default: {
 				WARN_PRINT("Unhandled script debugger message type: " + itos(type));
 				msg_type = EditorLog::MSG_TYPE_STD;
@@ -654,6 +673,7 @@ void ScriptEditorDebugger::_msg_error(uint64_t p_thread_id, const Array &p_data)
 	}
 	error->set_collapsed(true);
 
+	error->set_text_overrun_behavior(0, TextServer::OVERRUN_NO_TRIMMING);
 	error->set_icon(0, get_editor_theme_icon(oe.warning ? SNAME("Warning") : SNAME("Error")));
 	error->set_text(0, time);
 	error->set_text_alignment(0, HORIZONTAL_ALIGNMENT_LEFT);
@@ -678,6 +698,7 @@ void ScriptEditorDebugger::_msg_error(uint64_t p_thread_id, const Array &p_data)
 	error_title += oe.error_descr.is_empty() ? oe.error : oe.error_descr;
 	error->set_text(1, error_title);
 	error->set_autowrap_mode(1, TextServer::AUTOWRAP_WORD_SMART);
+	error->set_autowrap_trim_flags(1, 0);
 	tooltip += " " + error_title + "\n";
 
 	// Find the language of the error's source file.
@@ -902,12 +923,16 @@ void ScriptEditorDebugger::_msg_request_quit(uint64_t p_thread_id, const Array &
 
 void ScriptEditorDebugger::_msg_remote_objects_selected(uint64_t p_thread_id, const Array &p_data) {
 	ERR_FAIL_COND(p_data.is_empty());
-	EditorDebuggerRemoteObjects *objs = inspector->set_objects(p_data);
-	if (objs) {
-		EditorDebuggerNode::get_singleton()->stop_waiting_inspection();
+	EditorDebuggerNode *dbg = EditorDebuggerNode::get_singleton();
+	EditorDebuggerRemoteObjects *robjs = inspector->set_objects(p_data, dbg->get_debugger_id(this));
+	if (robjs) {
+		dbg->stop_waiting_inspection();
+		if (dbg->get_current_debugger() != this) {
+			dbg->set_current_debugger(robjs->debugger_id);
+		}
 
-		emit_signal(SNAME("remote_objects_updated"), objs);
-		emit_signal(SNAME("remote_tree_select_requested"), objs->remote_object_ids.duplicate());
+		emit_signal(SNAME("remote_objects_updated"), robjs);
+		emit_signal(SNAME("remote_tree_select_requested"), robjs->remote_object_ids.duplicate());
 	}
 }
 
@@ -922,8 +947,9 @@ void ScriptEditorDebugger::_msg_remote_selection_invalidated(uint64_t p_thread_i
 	inspector->invalidate_selection_from_cache(p_data[0]);
 }
 
-void ScriptEditorDebugger::_msg_show_selection_limit_warning(uint64_t p_thread_id, const Array &p_data) {
-	EditorToaster::get_singleton()->popup_str(vformat(TTR("Some remote nodes were not selected, as the configured maximum selection is %d. This can be changed at \"debugger/max_node_selection\" in the Editor Settings."), EDITOR_GET("debugger/max_node_selection")), EditorToaster::SEVERITY_WARNING);
+void ScriptEditorDebugger::_msg_remote_undo_redo_action(uint64_t p_thread_id, const Array &p_data) {
+	ERR_FAIL_COND(p_data.size() < 2);
+	inspector->add_undo_redo_action(p_data);
 }
 
 void ScriptEditorDebugger::_msg_performance_profile_names(uint64_t p_thread_id, const Array &p_data) {
@@ -964,12 +990,15 @@ void ScriptEditorDebugger::_msg_window_title(uint64_t p_thread_id, const Array &
 	emit_signal(SNAME("remote_window_title_changed"), p_data[0]);
 }
 
-void ScriptEditorDebugger::_msg_embed_suspend_toggle(uint64_t p_thread_id, const Array &p_data) {
-	emit_signal(SNAME("embed_shortcut_requested"), EMBED_SUSPEND_TOGGLE);
-}
-
-void ScriptEditorDebugger::_msg_embed_next_frame(uint64_t p_thread_id, const Array &p_data) {
-	emit_signal(SNAME("embed_shortcut_requested"), EMBED_NEXT_FRAME);
+void ScriptEditorDebugger::_msg_editor_shortcut_pressed(uint64_t p_thread_id, const Array &p_data) {
+	ERR_FAIL_COND(p_data.size() != 1);
+	Ref<Shortcut> shortcut = EditorSettings::get_singleton()->get_shortcut(p_data[0]);
+	if (shortcut.is_valid() && shortcut->has_valid_event()) {
+		Ref<InputEventShortcut> s;
+		s.instantiate();
+		s->set_shortcut(shortcut);
+		Input::get_singleton()->parse_input_event(s);
+	}
 }
 
 void ScriptEditorDebugger::_parse_message(const String &p_msg, uint64_t p_thread_id, const Array &p_data) {
@@ -1019,13 +1048,12 @@ void ScriptEditorDebugger::_init_parse_message_handlers() {
 	parse_message_handlers["remote_objects_selected"] = &ScriptEditorDebugger::_msg_remote_objects_selected;
 	parse_message_handlers["remote_nothing_selected"] = &ScriptEditorDebugger::_msg_remote_nothing_selected;
 	parse_message_handlers["remote_selection_invalidated"] = &ScriptEditorDebugger::_msg_remote_selection_invalidated;
-	parse_message_handlers["show_selection_limit_warning"] = &ScriptEditorDebugger::_msg_show_selection_limit_warning;
+	parse_message_handlers["remote_undo_redo_action"] = &ScriptEditorDebugger::_msg_remote_undo_redo_action;
 	parse_message_handlers["performance:profile_names"] = &ScriptEditorDebugger::_msg_performance_profile_names;
 	parse_message_handlers["filesystem:update_file"] = &ScriptEditorDebugger::_msg_filesystem_update_file;
 	parse_message_handlers["evaluation_return"] = &ScriptEditorDebugger::_msg_evaluation_return;
 	parse_message_handlers["window:title"] = &ScriptEditorDebugger::_msg_window_title;
-	parse_message_handlers["request_embed_suspend_toggle"] = &ScriptEditorDebugger::_msg_embed_suspend_toggle;
-	parse_message_handlers["request_embed_next_frame"] = &ScriptEditorDebugger::_msg_embed_next_frame;
+	parse_message_handlers["editor_shortcut_pressed"] = &ScriptEditorDebugger::_msg_editor_shortcut_pressed;
 }
 
 void ScriptEditorDebugger::_set_reason_text(const String &p_reason, MessageType p_type) {
@@ -1095,8 +1123,6 @@ void ScriptEditorDebugger::_notification(int p_what) {
 		} break;
 
 		case NOTIFICATION_THEME_CHANGED: {
-			tabs->add_theme_style_override(SceneStringName(panel), get_theme_stylebox(SNAME("DebuggerPanel"), EditorStringName(EditorStyles)));
-
 			skip_breakpoints->set_button_icon(get_editor_theme_icon(skip_breakpoints_value ? SNAME("DebugSkipBreakpointsOn") : SNAME("DebugSkipBreakpointsOff")));
 			ignore_error_breaks->set_button_icon(get_editor_theme_icon(ignore_error_breaks_value ? SNAME("NotificationDisabled") : SNAME("Notification")));
 			ignore_error_breaks->add_theme_color_override("icon_normal_color", get_theme_color(SNAME("error_color"), SNAME("Editor")));
@@ -1112,10 +1138,19 @@ void ScriptEditorDebugger::_notification(int p_what) {
 			vmem_notice_icon->set_texture(get_editor_theme_icon(SNAME("NodeInfo")));
 			vmem_refresh->set_button_icon(get_editor_theme_icon(SNAME("Reload")));
 			vmem_export->set_button_icon(get_editor_theme_icon(SNAME("Save")));
+			vmem_item_menu->set_item_icon(VMEM_MENU_SHOW_IN_FILESYSTEM, get_editor_theme_icon(SNAME("ShowInFileSystem")));
+			vmem_item_menu->set_item_icon(VMEM_MENU_SHOW_IN_EXPLORER, get_editor_theme_icon(SNAME("Filesystem")));
 			search->set_right_icon(get_editor_theme_icon(SNAME("Search")));
 
 			reason->add_theme_color_override(SNAME("default_color"), get_theme_color(SNAME("error_color"), EditorStringName(Editor)));
 			reason->add_theme_style_override(SNAME("normal"), get_theme_stylebox(SNAME("normal"), SNAME("Label"))); // Empty stylebox.
+
+			const Ref<Font> source_font = get_theme_font(SNAME("output_source"), EditorStringName(EditorFonts));
+			if (source_font.is_valid()) {
+				error_tree->add_theme_font_override("font", source_font);
+			}
+			const int font_size = get_theme_font_size(SNAME("output_source_size"), EditorStringName(EditorFonts));
+			error_tree->add_theme_font_size_override("font_size", font_size);
 
 			TreeItem *error_root = error_tree->get_root();
 			if (error_root) {
@@ -1342,6 +1377,8 @@ void ScriptEditorDebugger::stop() {
 
 	visual_profiler->set_enabled(false);
 	visual_profiler->set_profiling(false);
+
+	audio_muted_on_break = false;
 
 	inspector->edit(nullptr);
 	_update_buttons_state();
@@ -1694,6 +1731,11 @@ void ScriptEditorDebugger::_mute_audio_on_break(bool p_mute) {
 	audio_muted_on_break = p_mute;
 }
 
+void ScriptEditorDebugger::set_debug_collisions(bool p_enable) {
+	Array msg = { p_enable };
+	_put_msg("scene:set_debug_collisions", msg);
+}
+
 CameraOverride ScriptEditorDebugger::get_camera_override() const {
 	return camera_override;
 }
@@ -1832,6 +1874,45 @@ void ScriptEditorDebugger::_vmem_item_activated() {
 		return;
 	}
 	FileSystemDock::get_singleton()->navigate_to_path(path);
+}
+
+void ScriptEditorDebugger::_vmem_tree_rmb_selected(const Vector2 &p_pos, MouseButton p_button) {
+	if (p_button != MouseButton::RIGHT) {
+		return;
+	}
+
+	TreeItem *item = vmem_tree->get_selected();
+	if (!item) {
+		return;
+	}
+
+	String path = item->get_text(0);
+	if (path.is_empty() || !FileAccess::exists(path)) {
+		return;
+	}
+
+	vmem_item_menu->set_position(vmem_tree->get_screen_position() + p_pos);
+	vmem_item_menu->popup();
+}
+
+void ScriptEditorDebugger::_vmem_item_menu_id_pressed(int p_option) {
+	TreeItem *item = vmem_tree->get_selected();
+	if (!item) {
+		return;
+	}
+
+	String path = item->get_text(0);
+	switch (p_option) {
+		case VMEM_MENU_SHOW_IN_FILESYSTEM: {
+			FileSystemDock::get_singleton()->navigate_to_path(path);
+		} break;
+		case VMEM_MENU_SHOW_IN_EXPLORER: {
+			OS::get_singleton()->shell_show_in_file_manager(ProjectSettings::get_singleton()->globalize_path(path), true);
+		} break;
+		case VMEM_MENU_OWNERS: {
+			FileSystemDock::get_owners_dialog()->show(path);
+		} break;
+	}
 }
 
 void ScriptEditorDebugger::_clear_errors_list() {
@@ -2018,7 +2099,6 @@ void ScriptEditorDebugger::_bind_methods() {
 	ADD_SIGNAL(MethodInfo("set_breakpoint", PropertyInfo("script"), PropertyInfo(Variant::INT, "line"), PropertyInfo(Variant::BOOL, "enabled")));
 	ADD_SIGNAL(MethodInfo("clear_breakpoints"));
 	ADD_SIGNAL(MethodInfo("errors_cleared"));
-	ADD_SIGNAL(MethodInfo("embed_shortcut_requested", PropertyInfo(Variant::INT, "embed_shortcut_action")));
 }
 
 void ScriptEditorDebugger::add_debugger_tab(Control *p_control) {
@@ -2048,6 +2128,16 @@ void ScriptEditorDebugger::toggle_profiler(const String &p_profiler, bool p_enab
 	_put_msg("profiler:" + p_profiler, msg_data);
 }
 
+void ScriptEditorDebugger::update_layout(EditorDock::DockLayout p_layout, int p_slot) {
+	if (p_slot != EditorDock::DOCK_SLOT_BOTTOM) {
+		vmem_mc->set_theme_type_variation("NoBorderHorizontalBottom");
+		vmem_tree->set_scroll_hint_mode(Tree::SCROLL_HINT_MODE_DISABLED);
+	} else {
+		vmem_mc->set_theme_type_variation("NoBorderHorizontal");
+		vmem_tree->set_scroll_hint_mode(Tree::SCROLL_HINT_MODE_BOTTOM);
+	}
+}
+
 ScriptEditorDebugger::ScriptEditorDebugger() {
 	if (unlikely(parse_message_handlers.is_empty())) {
 		_init_parse_message_handlers();
@@ -2074,66 +2164,70 @@ ScriptEditorDebugger::ScriptEditorDebugger() {
 		reason->set_context_menu_enabled(true);
 		reason->set_h_size_flags(SIZE_EXPAND_FILL);
 		reason->set_v_size_flags(SIZE_SHRINK_CENTER);
-		reason->connect(SceneStringName(resized), callable_mp(this, &ScriptEditorDebugger::_update_reason_content_height));
+		reason->connect(SceneStringName(resized), callable_mp(this, &ScriptEditorDebugger::_update_reason_content_height), CONNECT_DEFERRED);
 		hbc->add_child(reason);
 
-		hbc->add_child(memnew(VSeparator));
+		HBoxContainer *buttons = memnew(HBoxContainer);
+		buttons->set_v_size_flags(SIZE_SHRINK_END);
+		hbc->add_child(buttons);
+
+		buttons->add_child(memnew(VSeparator));
 
 		skip_breakpoints = memnew(Button);
 		skip_breakpoints->set_theme_type_variation(SceneStringName(FlatButton));
-		hbc->add_child(skip_breakpoints);
+		buttons->add_child(skip_breakpoints);
 		skip_breakpoints->set_tooltip_text(TTRC("Skip Breakpoints"));
 		skip_breakpoints->connect(SceneStringName(pressed), callable_mp(this, &ScriptEditorDebugger::debug_skip_breakpoints));
 
 		ignore_error_breaks = memnew(Button);
 		ignore_error_breaks->set_theme_type_variation(SceneStringName(FlatButton));
 		ignore_error_breaks->set_tooltip_text(TTRC("Ignore Error Breaks"));
-		hbc->add_child(ignore_error_breaks);
+		buttons->add_child(ignore_error_breaks);
 		ignore_error_breaks->connect(SceneStringName(pressed), callable_mp(this, &ScriptEditorDebugger::debug_ignore_error_breaks));
 
-		hbc->add_child(memnew(VSeparator));
+		buttons->add_child(memnew(VSeparator));
 
 		copy = memnew(Button);
 		copy->set_theme_type_variation(SceneStringName(FlatButton));
-		hbc->add_child(copy);
+		buttons->add_child(copy);
 		copy->set_tooltip_text(TTRC("Copy Error"));
 		copy->connect(SceneStringName(pressed), callable_mp(this, &ScriptEditorDebugger::debug_copy));
 
-		hbc->add_child(memnew(VSeparator));
+		buttons->add_child(memnew(VSeparator));
 
 		step = memnew(Button);
 		step->set_theme_type_variation(SceneStringName(FlatButton));
-		hbc->add_child(step);
+		buttons->add_child(step);
 		step->set_tooltip_text(TTRC("Step Into"));
 		step->set_shortcut(ED_GET_SHORTCUT("debugger/step_into"));
 		step->connect(SceneStringName(pressed), callable_mp(this, &ScriptEditorDebugger::debug_step));
 
 		next = memnew(Button);
 		next->set_theme_type_variation(SceneStringName(FlatButton));
-		hbc->add_child(next);
+		buttons->add_child(next);
 		next->set_tooltip_text(TTRC("Step Over"));
 		next->set_shortcut(ED_GET_SHORTCUT("debugger/step_over"));
 		next->connect(SceneStringName(pressed), callable_mp(this, &ScriptEditorDebugger::debug_next));
 
 		out = memnew(Button);
 		out->set_theme_type_variation(SceneStringName(FlatButton));
-		hbc->add_child(out);
+		buttons->add_child(out);
 		out->set_tooltip_text(TTRC("Step Out"));
 		out->set_shortcut(ED_GET_SHORTCUT("debugger/step_out"));
 		out->connect(SceneStringName(pressed), callable_mp(this, &ScriptEditorDebugger::debug_out));
 
-		hbc->add_child(memnew(VSeparator));
+		buttons->add_child(memnew(VSeparator));
 
 		dobreak = memnew(Button);
 		dobreak->set_theme_type_variation(SceneStringName(FlatButton));
-		hbc->add_child(dobreak);
+		buttons->add_child(dobreak);
 		dobreak->set_tooltip_text(TTRC("Break"));
 		dobreak->set_shortcut(ED_GET_SHORTCUT("debugger/break"));
 		dobreak->connect(SceneStringName(pressed), callable_mp(this, &ScriptEditorDebugger::debug_break));
 
 		docontinue = memnew(Button);
 		docontinue->set_theme_type_variation(SceneStringName(FlatButton));
-		hbc->add_child(docontinue);
+		buttons->add_child(docontinue);
 		docontinue->set_tooltip_text(TTRC("Continue"));
 		docontinue->set_shortcut(ED_GET_SHORTCUT("debugger/continue"));
 		docontinue->connect(SceneStringName(pressed), callable_mp(this, &ScriptEditorDebugger::debug_continue));
@@ -2189,6 +2283,7 @@ ScriptEditorDebugger::ScriptEditorDebugger() {
 		inspector->connect("object_selected", callable_mp(this, &ScriptEditorDebugger::_remote_object_selected));
 		inspector->connect("objects_edited", callable_mp(this, &ScriptEditorDebugger::_remote_objects_edited));
 		inspector->connect("object_property_updated", callable_mp(this, &ScriptEditorDebugger::_remote_object_property_updated));
+		inspector->connect("canvas_item_objects_changed", callable_mp(this, &ScriptEditorDebugger::change_canvas_item_objects));
 		inspector->register_text_enter(search);
 		inspector->set_use_filter(true);
 		inspector_vbox->add_child(inspector);
@@ -2239,7 +2334,7 @@ ScriptEditorDebugger::ScriptEditorDebugger() {
 
 		clear_button = memnew(Button);
 		clear_button->set_text(TTRC("Clear"));
-		clear_button->set_h_size_flags(0);
+		clear_button->set_h_size_flags(SIZE_SHRINK_BEGIN);
 		clear_button->set_disabled(true);
 		clear_button->connect(SceneStringName(pressed), callable_mp(this, &ScriptEditorDebugger::_clear_errors_list));
 		error_hbox->add_child(clear_button);
@@ -2249,7 +2344,7 @@ ScriptEditorDebugger::ScriptEditorDebugger() {
 
 		error_tree->set_column_expand(0, false);
 		error_tree->set_column_custom_minimum_width(0, 140);
-		error_tree->set_column_clip_content(0, true);
+		error_tree->set_column_clip_content(0, false);
 
 		error_tree->set_column_expand(1, true);
 		error_tree->set_column_clip_content(1, true);
@@ -2352,10 +2447,10 @@ Instead, use the monitors tab to obtain more precise VRAM usage.
 		vmem_refresh->connect(SceneStringName(pressed), callable_mp(this, &ScriptEditorDebugger::_video_mem_request));
 		vmem_export->connect(SceneStringName(pressed), callable_mp(this, &ScriptEditorDebugger::_video_mem_export));
 
-		MarginContainer *mc = memnew(MarginContainer);
-		mc->set_theme_type_variation("NoBorderBottomPanel");
-		mc->set_v_size_flags(SIZE_EXPAND_FILL);
-		vmem_vb->add_child(mc);
+		vmem_mc = memnew(MarginContainer);
+		vmem_mc->set_theme_type_variation("NoBorderHorizontal");
+		vmem_mc->set_v_size_flags(SIZE_EXPAND_FILL);
+		vmem_vb->add_child(vmem_mc);
 
 		vmem_tree = memnew(Tree);
 		vmem_vb->set_name(TTRC("Video RAM"));
@@ -2374,10 +2469,18 @@ Instead, use the monitors tab to obtain more precise VRAM usage.
 		vmem_tree->set_column_custom_minimum_width(3, 80 * EDSCALE);
 		vmem_tree->set_hide_root(true);
 		vmem_tree->set_scroll_hint_mode(Tree::SCROLL_HINT_MODE_BOTTOM);
-		mc->add_child(vmem_tree);
+		vmem_mc->add_child(vmem_tree);
+		vmem_tree->set_allow_rmb_select(true);
 		vmem_tree->connect("item_activated", callable_mp(this, &ScriptEditorDebugger::_vmem_item_activated));
-
+		vmem_tree->connect("item_mouse_selected", callable_mp(this, &ScriptEditorDebugger::_vmem_tree_rmb_selected));
 		tabs->add_child(vmem_vb);
+
+		vmem_item_menu = memnew(PopupMenu);
+		vmem_item_menu->connect(SceneStringName(id_pressed), callable_mp(this, &ScriptEditorDebugger::_vmem_item_menu_id_pressed));
+		vmem_item_menu->add_item(TTRC("Show in FileSystem"), VMEM_MENU_SHOW_IN_FILESYSTEM);
+		vmem_item_menu->add_item(OS::get_singleton()->get_platform_string(OS::PLATFORM_STRING_FILE_MANAGER_SHOW), VMEM_MENU_SHOW_IN_EXPLORER);
+		vmem_item_menu->add_item(TTRC("View Owners..."), VMEM_MENU_OWNERS);
+		add_child(vmem_item_menu);
 	}
 
 	{ // misc
@@ -2420,7 +2523,7 @@ Instead, use the monitors tab to obtain more precise VRAM usage.
 			info_left->add_child(lehb);
 		}
 
-		misc->add_child(memnew(VSeparator));
+		misc->add_child(memnew(HSeparator));
 
 		HBoxContainer *buttons = memnew(HBoxContainer);
 
@@ -2431,12 +2534,6 @@ Instead, use the monitors tab to obtain more precise VRAM usage.
 		misc->add_child(buttons);
 	}
 
-	msgdialog = memnew(AcceptDialog);
-	add_child(msgdialog);
-
-	camera_override = CameraOverride::OVERRIDE_NONE;
-	error_count = 0;
-	warning_count = 0;
 	_update_buttons_state();
 }
 

@@ -66,6 +66,7 @@ class EditorSpinSlider : public Range {
 	uint64_t value_input_closed_frame = 0;
 	bool value_input_dirty = false;
 	bool value_input_focus_visible = false;
+	bool deferred_drag_mode = false;
 
 public:
 	enum ControlState {
@@ -95,8 +96,27 @@ private:
 	void _draw_spin_slider();
 
 	struct ThemeCache {
+		int inspector_property_height = 0;
+		int line_edit_margin = 0;
+		int line_edit_margin_empty = 0;
+
+		Color font_color;
+		Color font_uneditable_color;
+		Color label_color;
+		Color read_only_label_color;
+
+		Ref<Font> font;
+		int font_size = 0;
+
+		Ref<StyleBox> normal;
+		Ref<StyleBox> read_only;
+		Ref<StyleBox> focus;
+		Ref<StyleBox> label_bg;
+
 		Ref<Texture2D> updown_icon;
 		Ref<Texture2D> updown_disabled_icon;
+		Ref<Texture2D> grabber_highlight;
+		Ref<Texture2D> grabber;
 	} theme_cache;
 
 protected:
@@ -137,6 +157,8 @@ public:
 	bool is_flat() const;
 
 	bool is_grabbing() const;
+	void set_deferred_drag_mode_enabled(bool p_enabled = true);
+	bool is_deferred_drag_mode_enabled() const;
 
 	void setup_and_show() { _focus_entered(); }
 	LineEdit *get_line_edit();
