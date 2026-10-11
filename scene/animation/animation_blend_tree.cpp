@@ -438,7 +438,11 @@ void AnimationNodeSync::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_use_sync", "enable"), &AnimationNodeSync::set_use_sync);
 	ClassDB::bind_method(D_METHOD("is_using_sync"), &AnimationNodeSync::is_using_sync);
 
+	ClassDB::bind_method(D_METHOD("set_skip_zero_weight_inputs", "enable"), &AnimationNodeSync::set_skip_zero_weight_inputs);
+	ClassDB::bind_method(D_METHOD("is_skipping_zero_weight_inputs"), &AnimationNodeSync::is_skipping_zero_weight_inputs);
+
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "sync"), "set_use_sync", "is_using_sync");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "skip_zero_weight_inputs"), "set_skip_zero_weight_inputs", "is_skipping_zero_weight_inputs");
 }
 
 void AnimationNodeSync::set_use_sync(bool p_sync) {
@@ -447,6 +451,14 @@ void AnimationNodeSync::set_use_sync(bool p_sync) {
 
 bool AnimationNodeSync::is_using_sync() const {
 	return sync;
+}
+
+void AnimationNodeSync::set_skip_zero_weight_inputs(bool p_skip) {
+	skip_zero_weight_inputs = p_skip;
+}
+
+bool AnimationNodeSync::is_skipping_zero_weight_inputs() const {
+	return skip_zero_weight_inputs;
 }
 
 AnimationNodeSync::AnimationNodeSync() {

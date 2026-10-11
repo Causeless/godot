@@ -121,6 +121,9 @@ public:
 	void set_use_sync(bool p_sync);
 	bool is_using_sync() const;
 
+	void set_skip_zero_weight_inputs(bool p_skip);
+	bool is_skipping_zero_weight_inputs() const;
+
 	AnimationNodeSync();
 };
 

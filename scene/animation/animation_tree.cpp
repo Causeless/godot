@@ -263,6 +263,15 @@ AnimationNode::NodeTimeInfo AnimationNode::_blend_node(ProcessState &p_process_s
 	// This process, which depends on p_sync is needed to process sync correctly in the case of
 	// that a synced AnimationNodeSync exists under the un-synced AnimationNodeSync.
 	if (!p_playback_info.seeked && !p_sync && !any_valid) {
+		if (skip_zero_weight_inputs) {
+			// Skip the input entirely rather than processing it with frozen time. It contributes nothing to the
+			// blend, and blend nodes only report their dominant input's time, so its stored time info is enough.
+			NodeTimeInfo nti;
+			nti.length = *VariantInternal::get_float(p_other.parameter_ptrs_by_slot[AnimationNodeInstance::SLOT_CURRENT_LENGTH]);
+			nti.position = *VariantInternal::get_float(p_other.parameter_ptrs_by_slot[AnimationNodeInstance::SLOT_CURRENT_POSITION]);
+			p_other.blended = false;
+			return nti;
+		}
 		p_playback_info.delta = 0.0;
 	}
 	p_other.blended = any_valid;

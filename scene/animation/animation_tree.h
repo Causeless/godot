@@ -84,6 +84,7 @@ public:
 	LocalVector<Input> inputs;
 	HashSet<NodePath> filter;
 	bool filter_enabled = false;
+	bool skip_zero_weight_inputs = false; // Exposed by AnimationNodeSync, see its docs.
 
 	// To propagate information from upstream for use in estimation of playback progress.
 	// These values must be taken from the result of blend_node() or blend_input() and must be essentially read-only.

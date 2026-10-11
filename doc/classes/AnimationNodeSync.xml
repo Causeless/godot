@@ -10,6 +10,10 @@
 		<link title="Using AnimationTree">$DOCS_URL/tutorials/animation/animation_tree.html</link>
 	</tutorials>
 	<members>
+		<member name="skip_zero_weight_inputs" type="bool" setter="set_skip_zero_weight_inputs" getter="is_skipping_zero_weight_inputs" default="false">
+			If [code]true[/code] and [member sync] is [code]false[/code], inputs with a blend value of [code]0[/code] are not processed at all, instead of being processed with their frames stopped. This saves the full cost of evaluating that input's branch, which matters when a node selects between large sub-trees.
+			[b]Note:[/b] Requests inside a skipped branch, such as firing an [AnimationNodeOneShot], an [AnimationNodeTransition] transition request, a seek in [AnimationNodeTimeSeek] or a state machine condition, are only acted on once that input has a non-zero blend value again.
+		</member>
 		<member name="sync" type="bool" setter="set_use_sync" getter="is_using_sync" default="false">
 			If [code]false[/code], the blended animations' frame are stopped when the blend value is [code]0[/code].
 			If [code]true[/code], forcing the blended animations to advance frame.
