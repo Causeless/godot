@@ -550,7 +550,8 @@ void FindInFilesSearchPanel::_on_search_submitted() {
 void FindInFilesSearchPanel::_on_search_modified() {
 	finder->stop();
 	_update_finder();
-	debounce_timer->start(0.5);
+	// Fork change: no search-as-you-type, searching only happens on submit (Enter). A one-letter
+	// search over the whole project can freeze the editor for a very long time.
 }
 
 void FindInFilesSearchPanel::_update_finder() {
