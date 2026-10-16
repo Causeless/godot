@@ -37,6 +37,7 @@
 #include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
 #include "core/os/keyboard.h"
+#include "core/os/os.h"
 #include "editor/animation/animation_player_editor_plugin.h"
 #include "editor/debugger/editor_debugger_node.h"
 #include "editor/docks/filesystem_dock.h"
@@ -2096,9 +2097,20 @@ void SceneTreeDock::fill_path_renames(Node *p_node, Node *p_new_parent, HashMap<
 	_fill_path_renames(base_path, new_base_path, p_node, p_renames);
 }
 
-bool SceneTreeDock::_update_node_path(Node *p_root_node, NodePath &r_node_path, HashMap<Node *, NodePath> *p_renames) const {
+bool SceneTreeDock::_update_node_path(Node *p_root_node, NodePath &r_node_path, HashMap<Node *, NodePath> *p_renames) {
 	Node *target_node = p_root_node->get_node_or_null(r_node_path);
-	ERR_FAIL_NULL_V_MSG(target_node, false, "Found invalid node path '" + String(r_node_path) + "' on node '" + String(scene_root->get_path_to(p_root_node)) + "'");
+	if (!target_node) {
+		// Collected and reported once by perform_node_renames().
+		if (invalid_node_path_count == 0 || OS::get_singleton()->is_stdout_verbose()) {
+			const String description = vformat("'%s' on node '%s'", String(r_node_path), String(scene_root->get_path_to(p_root_node)));
+			if (invalid_node_path_count == 0) {
+				first_invalid_node_path = description;
+			}
+			print_verbose("Found invalid node path " + description + ".");
+		}
+		invalid_node_path_count++;
+		return false;
+	}
 
 	// Try to find the target node in modified node paths.
 	HashMap<Node *, NodePath>::Iterator found_node_path = p_renames->find(target_node);
@@ -2162,11 +2174,69 @@ _ALWAYS_INLINE_ static bool _recurse_into_property(const PropertyInfo &p_propert
 	return false;
 }
 
-void SceneTreeDock::_check_object_properties_recursive(Node *p_root_node, Object *p_obj, HashMap<Node *, NodePath> *p_renames, bool p_inside_resource) const {
-	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
+bool SceneTreeDock::_node_property_list_is_reusable(Node *p_node) const {
+	// GDExtension classes can list properties per instance.
+	if (ClassDB::get_api_type(p_node->get_class_name()) == ClassDB::API_EXTENSION) {
+		return false;
+	}
+
+	// Scripts can list or validate properties per instance, and a script that failed to compile makes
+	// its placeholder instances list whatever the scene stored for each node.
+	for (Ref<Script> script = p_node->get_script(); script.is_valid(); script = script->get_base_script()) {
+		if (script->is_placeholder_fallback_enabled() || script->has_method(SNAME("_get_property_list")) || script->has_method(SNAME("_validate_property"))) {
+			return false;
+		}
+	}
+
+	// Native classes whose node path properties depend on the instance, see their _get_property_list().
+	static const StringName dynamic_node_path_classes[] = { SNAME("SoftBody3D"), SNAME("TwoBoneIK3D"), SNAME("IterateIK3D"), SNAME("SplineIK3D"), SNAME("SpringBoneSimulator3D") };
+	for (const StringName &dynamic_class : dynamic_node_path_classes) {
+		if (ClassDB::is_parent_class(p_node->get_class_name(), dynamic_class)) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+void SceneTreeDock::_check_object_property(Node *p_root_node, Object *p_obj, const StringName &p_property, HashMap<Node *, NodePath> *p_renames, bool p_inside_resource) {
+	Variant old_variant = p_obj->get(p_property);
+	Variant updated_variant = old_variant;
+	if (_check_node_path_recursive(p_root_node, updated_variant, p_renames, p_inside_resource)) {
+		EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
+		undo_redo->add_do_property(p_obj, p_property, updated_variant);
+		undo_redo->add_undo_property(p_obj, p_property, old_variant);
+	}
+}
+
+void SceneTreeDock::_check_object_properties_recursive(Node *p_root_node, Object *p_obj, HashMap<Node *, NodePath> *p_renames, bool p_inside_resource) {
+	Node *node = p_inside_resource ? nullptr : Object::cast_to<Node>(p_obj);
+	NodePathPropertyCacheEntry *cached = nullptr;
+	Pair<StringName, uint64_t> cache_key;
+	if (node) {
+		Ref<Script> script = node->get_script();
+		cache_key.first = node->get_class_name();
+		cache_key.second = script.is_valid() ? uint64_t(script->get_instance_id()) : 0;
+		cached = node_path_property_cache.getptr(cache_key);
+		if (cached && cached->reusable) {
+			for (const StringName &property_name : cached->property_names) {
+				_check_object_property(p_root_node, p_obj, property_name, p_renames, p_inside_resource);
+			}
+			// Metadata is listed as properties as well, but differs per node.
+			List<StringName> meta_list;
+			node->get_meta_list(&meta_list);
+			for (const StringName &meta_name : meta_list) {
+				_check_object_property(p_root_node, p_obj, "metadata/" + meta_name, p_renames, p_inside_resource);
+			}
+			return;
+		}
+	}
 
 	List<PropertyInfo> properties;
 	p_obj->get_property_list(&properties);
+
+	NodePathPropertyCacheEntry entry;
+	entry.reusable = node && !cached && _node_property_list_is_reusable(node);
 
 	for (const PropertyInfo &E : properties) {
 		if (!_recurse_into_property(E)) {
@@ -2174,17 +2244,19 @@ void SceneTreeDock::_check_object_properties_recursive(Node *p_root_node, Object
 		}
 
 		StringName propertyname = E.name;
-
-		Variant old_variant = p_obj->get(propertyname);
-		Variant updated_variant = old_variant;
-		if (_check_node_path_recursive(p_root_node, updated_variant, p_renames, p_inside_resource)) {
-			undo_redo->add_do_property(p_obj, propertyname, updated_variant);
-			undo_redo->add_undo_property(p_obj, propertyname, old_variant);
+		if (entry.reusable && !E.name.begins_with("metadata/")) {
+			entry.property_names.push_back(propertyname);
 		}
+
+		_check_object_property(p_root_node, p_obj, propertyname, p_renames, p_inside_resource);
+	}
+
+	if (node && !cached) {
+		node_path_property_cache.insert(cache_key, entry);
 	}
 }
 
-bool SceneTreeDock::_check_node_path_recursive(Node *p_root_node, Variant &r_variant, HashMap<Node *, NodePath> *p_renames, bool p_inside_resource) const {
+bool SceneTreeDock::_check_node_path_recursive(Node *p_root_node, Variant &r_variant, HashMap<Node *, NodePath> *p_renames, bool p_inside_resource) {
 	switch (r_variant.get_type()) {
 		case Variant::NODE_PATH: {
 			NodePath node_path = r_variant;
@@ -2271,8 +2343,12 @@ bool SceneTreeDock::_check_node_path_recursive(Node *p_root_node, Variant &r_var
 
 void SceneTreeDock::perform_node_renames(Node *p_base, HashMap<Node *, NodePath> *p_renames, HashMap<Ref<Animation>, HashSet<int>> *r_rem_anims, LocalVector<Pair<StringName, StringName>> *r_folded_group_renames) {
 	HashMap<Ref<Animation>, HashSet<int>> rem_anims;
-	if (!r_rem_anims) {
+	const bool is_top_level = r_rem_anims == nullptr;
+	if (is_top_level) {
 		r_rem_anims = &rem_anims;
+		invalid_node_path_count = 0;
+		first_invalid_node_path = String();
+		node_path_property_cache.clear();
 	}
 
 	if (!p_base) {
@@ -2281,6 +2357,17 @@ void SceneTreeDock::perform_node_renames(Node *p_base, HashMap<Node *, NodePath>
 
 	if (!p_base) {
 		return;
+	}
+
+	// Only nodes that can be edited and saved from this scene need their references updated: the ones
+	// owned by the edited scene, and the ones inside an editable instance. Anything else (the internals
+	// of regular instanced scenes) is neither shown in the scene tree nor saved, and large scenes can
+	// contain many times more of those than editable nodes, so skip such subtrees entirely.
+	if (p_base != edited_scene) {
+		Node *owner = p_base->get_owner();
+		if (owner != edited_scene && !(owner && edited_scene->is_ancestor_of(owner) && edited_scene->is_editable_instance(owner))) {
+			return;
+		}
 	}
 
 	// No renaming if base node is deleted.
@@ -2419,6 +2506,14 @@ void SceneTreeDock::perform_node_renames(Node *p_base, HashMap<Node *, NodePath>
 
 	for (int i = 0; i < p_base->get_child_count(); i++) {
 		perform_node_renames(p_base->get_child(i), p_renames, r_rem_anims, r_folded_group_renames);
+	}
+
+	if (is_top_level) {
+		node_path_property_cache.clear();
+		if (invalid_node_path_count > 0) {
+			// Reported once per operation: printing one error per dangling path is slow when a large scene has many of them.
+			ERR_PRINT(vformat("Found %d invalid node path(s) while updating node references, the first one is %s. Run the editor with --verbose to list all of them.", invalid_node_path_count, first_invalid_node_path));
+		}
 	}
 }
 

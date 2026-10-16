@@ -332,9 +332,24 @@ class SceneTreeDock : public EditorDock {
 	static void _update_configuration_warning();
 	static Dictionary _get_context_data(const List<Node *> &p_selected_nodes);
 
-	bool _update_node_path(Node *p_root_node, NodePath &r_node_path, HashMap<Node *, NodePath> *p_renames) const;
-	void _check_object_properties_recursive(Node *p_root_node, Object *p_obj, HashMap<Node *, NodePath> *p_renames, bool p_inside_resource = false) const;
-	bool _check_node_path_recursive(Node *p_root_node, Variant &r_variant, HashMap<Node *, NodePath> *p_renames, bool p_inside_resource = false) const;
+	// Invalid node paths met while updating node references are counted here and reported once by perform_node_renames().
+	int invalid_node_path_count = 0;
+	String first_invalid_node_path;
+
+	// The properties worth checking for node paths, per node class and script, built while perform_node_renames()
+	// runs. Listing every property of every node dominates that scan in large scenes, and nodes sharing a class
+	// and script share the same property list.
+	struct NodePathPropertyCacheEntry {
+		bool reusable = false;
+		LocalVector<StringName> property_names;
+	};
+	HashMap<Pair<StringName, uint64_t>, NodePathPropertyCacheEntry> node_path_property_cache;
+
+	bool _node_property_list_is_reusable(Node *p_node) const;
+	bool _update_node_path(Node *p_root_node, NodePath &r_node_path, HashMap<Node *, NodePath> *p_renames);
+	void _check_object_property(Node *p_root_node, Object *p_obj, const StringName &p_property, HashMap<Node *, NodePath> *p_renames, bool p_inside_resource);
+	void _check_object_properties_recursive(Node *p_root_node, Object *p_obj, HashMap<Node *, NodePath> *p_renames, bool p_inside_resource = false);
+	bool _check_node_path_recursive(Node *p_root_node, Variant &r_variant, HashMap<Node *, NodePath> *p_renames, bool p_inside_resource = false);
 	bool _check_node_recursive(Variant &r_variant, Node *p_node, Node *p_by_node, const String type_hint, String &r_warn_message);
 	void _replace_node(Node *p_node, Node *p_by_node, bool p_keep_properties = true);
 
