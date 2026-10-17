@@ -53,7 +53,11 @@ public:
 		ROUTE_AROUND = 0, // The flood's first layer: paths that went through nothing yet.
 		ROUTE_THROUGH = 1, // Its second layer: paths that went through terrain or a blocker.
 		ROUTE_COUNT = 2,
+		EMITTER_OUT_OF_RANGE = 0, // Resolved emitter further than the attenuation distance as the crow flies.
+		EMITTER_SEALED = 1, // Within range but no route this way is better than a wall, or buried inside thick terrain.
+		EMITTER_REACHED = 2, // Sound gets there this way, see its path distance, opening and occlusion.
 	};
 
 	static Dictionary flood(const PackedByteArray &p_solid_cells, const PackedByteArray &p_cell_weights, int p_row_length, int p_row_amount, const Vector2i &p_window_origin_cell, int p_window_side, const PackedVector2Array &p_seed_window_cells, const Vector2 &p_player_point, const PackedVector2Array &p_blocked_cells, const PackedInt32Array &p_blocked_costs, const PackedByteArray &p_blocked_occlusions, const Dictionary &p_costs);
+	static Dictionary resolve(const Dictionary &p_field, int p_layer_offset, int p_window_side, float p_cell_size, const PackedVector2Array &p_seed_window_cells, const Vector2i &p_window_origin_cell, const Vector2 &p_player_point, const PackedVector2Array &p_emitter_points, const Dictionary &p_costs);
 };

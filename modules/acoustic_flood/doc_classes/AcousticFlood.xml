@@ -27,7 +27,24 @@
 				Floods the square window of [param window_side] cells a side whose top left grid cell is [param window_origin_cell], over a grid of [param row_length] by [param row_amount] cells given as one byte per cell in [param solid_cells] (non-zero for solid) and [param cell_weights] (0 to [constant WEIGHT_FULL], how much a solid cell costs to enter; empty counts every solid cell as full). Cells outside the grid are open air.
 				The flood starts from [param seed_window_cells], in window cell coordinates, each at its distance from [param player_point], in continuous window cell coordinates. [param blocked_cells] are grid cells covered by blockers, each with a cost in [param blocked_costs] and an occlusion in [param blocked_occlusions] (0 to [constant BLOCKER_OCCLUSION_MASK]).
 				[param costs] tunes the flood, in tenths of a cell: [code]cost_orthogonal[/code], [code]cost_diagonal[/code], [code]max_distance[/code], [code]material_cost[/code], [code]material_cost_max[/code], [code]blocker_cost_max[/code], [code]wall_cost[/code], [code]through_dominance_margin[/code] and [code]seal_prune_margin[/code].
-				Returns a dictionary of arrays over both layers, the around layer's cells first and the through layer's after them at an offset of the window's cell count: [code]distances[/code] and [code]parents[/code] (window layered indices, [constant UNREACHED] where the flood didn't get), [code]blocker_occlusions[/code] (one byte per cell, occlusion plus [constant BLOCKER_PENDING_BIT] mid-crossing), [code]material_costs[/code] and [code]surcharges[/code] (how much of the distance is material entered, and material plus blockers), and over the window's cells only, [code]window_solid[/code] and [code]window_opaque[/code] (solid, or solid or blocked).
+				Returns a dictionary of arrays over both layers, the around layer's cells first and the through layer's after them at an offset of the window's cell count: [code]distances[/code] and [code]parents[/code] (window layered indices, [constant UNREACHED] where the flood didn't get), [code]blocker_occlusions[/code] (one byte per cell, occlusion plus [constant BLOCKER_PENDING_BIT] mid-crossing), [code]material_costs[/code] and [code]surcharges[/code] (how much of the distance is material entered, and material plus blockers), and over the window's cells only, [code]window_solid[/code] and [code]window_opaque[/code] (solid, or solid or blocked). The dictionary is what [method resolve] takes as its field.
+			</description>
+		</method>
+		<method name="resolve" qualifiers="static">
+			<return type="Dictionary" />
+			<param index="0" name="field" type="Dictionary" />
+			<param index="1" name="layer_offset" type="int" />
+			<param index="2" name="window_side" type="int" />
+			<param index="3" name="cell_size" type="float" />
+			<param index="4" name="seed_window_cells" type="PackedVector2Array" />
+			<param index="5" name="window_origin_cell" type="Vector2i" />
+			<param index="6" name="player_point" type="Vector2" />
+			<param index="7" name="emitter_points" type="PackedVector2Array" />
+			<param index="8" name="costs" type="Dictionary" />
+			<description>
+				Resolves each of [param emitter_points], in continuous window cell coordinates, against one layer of a [method flood] result [param field], the one starting at [param layer_offset]: whether sound reaches it that way and, if so, how far it travels along the taut path, the cell its sound last appears from on its way to the player and the occlusion it picks up. The window is [param window_side] cells a side with [param window_origin_cell] at its top left, each cell [param cell_size] px; strings are pulled from [param player_point] and the flood's [param seed_window_cells], all in window cell coordinates.
+				[param costs] takes [code]max_attenuation_distance[/code] (px), [code]wall_cost[/code] and [code]material_occlusion_full_cost[/code] (tenths of a cell), [code]snap_max_ring[/code] and [code]cell_inset[/code] (cells).
+				Returns a dictionary of arrays, one entry per emitter: [code]emitter_states[/code] ([constant EMITTER_OUT_OF_RANGE], [constant EMITTER_SEALED] or [constant EMITTER_REACHED]), [code]emitter_cells[/code] (the open grid cell resolved from), [code]emitter_costs[/code] (px, the taut path plus what's charged on it, INF unless reached), [code]emitter_path_distances[/code] (px, INF unless reached), [code]emitter_straight_distances[/code] (px), [code]emitter_opening_cells[/code] (grid cell of the first bend, the emitter's own with a clear line) and [code]emitter_occlusions[/code] (0 to 1).
 			</description>
 		</method>
 	</methods>
@@ -55,6 +72,15 @@
 		</constant>
 		<constant name="ROUTE_COUNT" value="2">
 			How many layers the flood has.
+		</constant>
+		<constant name="EMITTER_OUT_OF_RANGE" value="0">
+			A resolved emitter further than the attenuation distance as the crow flies.
+		</constant>
+		<constant name="EMITTER_SEALED" value="1">
+			A resolved emitter within range that no route this way reaches any better than a wall would, or that's buried inside thick terrain.
+		</constant>
+		<constant name="EMITTER_REACHED" value="2">
+			A resolved emitter sound gets to this way.
 		</constant>
 	</constants>
 </class>

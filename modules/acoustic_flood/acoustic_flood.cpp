@@ -312,8 +312,395 @@ Dictionary AcousticFlood::flood(const PackedByteArray &p_solid_cells, const Pack
 	return result;
 }
 
+// A point in continuous window cell coordinates, kept in doubles for precision in the geometry.
+struct ResolvePoint {
+	double x = 0.0;
+	double y = 0.0;
+	ResolvePoint() {}
+	ResolvePoint(double p_x, double p_y) :
+			x(p_x), y(p_y) {}
+	double distance_to(const ResolvePoint &p_other) const { return Math::sqrt((p_other.x - x) * (p_other.x - x) + (p_other.y - y) * (p_other.y - y)); }
+};
+
+static double _get_cost_double(const Dictionary &p_costs, const char *p_key, double p_default) {
+	const Variant *value = p_costs.getptr(String(p_key));
+	return value ? (double)(*value) : p_default;
+}
+
+// Returns the point moved to the nearest spot inside the window cell, kept p_inset in from its edges so it floors to that cell.
+static ResolvePoint _clamp_into_cell(const ResolvePoint &p_point, int p_cell_x, int p_cell_y, double p_inset) {
+	return ResolvePoint(CLAMP(p_point.x, p_cell_x + p_inset, p_cell_x + 1.0 - p_inset), CLAMP(p_point.y, p_cell_y + p_inset, p_cell_y + 1.0 - p_inset));
+}
+
+// Returns the window index of the point's cell if it's open air, otherwise of the open window cell within p_max_ring rings
+// whose center is nearest the point (so a thing just inside a floor resolves above it, one inside a ceiling below it, one
+// inside a wall on its open face), ties going to the cell nearest the player. -1 if there's no open air that close.
+static int _snap_to_open_window_index(const uint8_t *p_window_solid, int p_side, const ResolvePoint &p_point, const ResolvePoint &p_toward_point, int p_max_ring) {
+	const int cell_x = (int)Math::floor(p_point.x);
+	const int cell_y = (int)Math::floor(p_point.y);
+	const int index = cell_y * p_side + cell_x;
+	if (!p_window_solid[index]) {
+		return index;
+	}
+
+	for (int ring = 1; ring <= p_max_ring; ring++) {
+		int best_index = -1;
+		int64_t best_score = 0;
+		for (int offset_y = -ring; offset_y <= ring; offset_y++) {
+			const int candidate_y = cell_y + offset_y;
+			if (candidate_y < 0 || candidate_y >= p_side) {
+				continue;
+			}
+
+			for (int offset_x = -ring; offset_x <= ring; offset_x++) {
+				const int candidate_x = cell_x + offset_x;
+				if (candidate_x < 0 || candidate_x >= p_side || MAX(Math::abs(offset_x), Math::abs(offset_y)) != ring) {
+					continue;
+				}
+
+				const int candidate_index = candidate_y * p_side + candidate_x;
+				if (p_window_solid[candidate_index]) {
+					continue;
+				}
+
+				// Nearest the point first, in hundredths of a cell, the player's distance only ever breaking ties.
+				const ResolvePoint candidate_center(candidate_x + 0.5, candidate_y + 0.5);
+				const int64_t score = (int64_t)(candidate_center.distance_to(p_point) * 100.0) * 1000 + (int64_t)(candidate_center.distance_to(p_toward_point) * 10.0);
+				if (best_index == -1 || score < best_score) {
+					best_index = candidate_index;
+					best_score = score;
+				}
+			}
+		}
+
+		if (best_index != -1) {
+			return best_index;
+		}
+	}
+
+	// No open air within the rings, the cell is buried inside thick terrain.
+	return -1;
+}
+
+// Returns whether no opaque window cell (terrain or a blocker) lies on the straight line between two window points. Walks
+// the cells the line crosses one boundary at a time and, like the flood, refuses to slip through the joint between two
+// diagonal solid cells. The start and end cells themselves are never minded, as either may legitimately be terrain.
+static bool _has_line_of_sight_between_points(const uint8_t *p_window_opaque, int p_side, const ResolvePoint &p_from, const ResolvePoint &p_to) {
+	int cell_x = (int)Math::floor(p_from.x);
+	int cell_y = (int)Math::floor(p_from.y);
+	const int end_x = (int)Math::floor(p_to.x);
+	const int end_y = (int)Math::floor(p_to.y);
+	const double delta_x = p_to.x - p_from.x;
+	const double delta_y = p_to.y - p_from.y;
+	const int step_x = delta_x > 0.0 ? 1 : -1;
+	const int step_y = delta_y > 0.0 ? 1 : -1;
+	// Distance along the line (as a fraction of it) to the next cell boundary on each axis, and between boundaries.
+	double boundary_t_x = Math::INF;
+	double boundary_t_y = Math::INF;
+	double boundary_t_delta_x = Math::INF;
+	double boundary_t_delta_y = Math::INF;
+	if (delta_x != 0.0) {
+		boundary_t_delta_x = Math::abs(1.0 / delta_x);
+		boundary_t_x = ((step_x > 0 ? cell_x + 1 : cell_x) - p_from.x) / delta_x;
+	}
+
+	if (delta_y != 0.0) {
+		boundary_t_delta_y = Math::abs(1.0 / delta_y);
+		boundary_t_y = ((step_y > 0 ? cell_y + 1 : cell_y) - p_from.y) / delta_y;
+	}
+
+	int steps_left = Math::abs(end_x - cell_x) + Math::abs(end_y - cell_y);
+	while ((cell_x != end_x || cell_y != end_y) && steps_left > 0) {
+		steps_left--;
+		if (Math::is_equal_approx(boundary_t_x, boundary_t_y)) {
+			// Straight through a cell corner: both cells beside the joint must be open.
+			if (p_window_opaque[cell_y * p_side + cell_x + step_x] || p_window_opaque[(cell_y + step_y) * p_side + cell_x]) {
+				return false;
+			}
+
+			cell_x += step_x;
+			cell_y += step_y;
+			boundary_t_x += boundary_t_delta_x;
+			boundary_t_y += boundary_t_delta_y;
+		} else if (boundary_t_x < boundary_t_y) {
+			cell_x += step_x;
+			boundary_t_x += boundary_t_delta_x;
+		} else {
+			cell_y += step_y;
+			boundary_t_y += boundary_t_delta_y;
+		}
+
+		if ((cell_x != end_x || cell_y != end_y) && p_window_opaque[cell_y * p_side + cell_x]) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+// Returns the index of the farthest of the points after p_from_index, up to p_last_index, that's in view from the point,
+// assuming view is lost once along the path and not regained (true along a corridor), so it can gallop and bisect rather
+// than test every point.
+static int _farthest_visible_point(const LocalVector<ResolvePoint> &p_points, const uint8_t *p_window_opaque, int p_side, const ResolvePoint &p_from, int p_from_index, int p_last_index) {
+	if (_has_line_of_sight_between_points(p_window_opaque, p_side, p_from, p_points[p_last_index])) {
+		return p_last_index;
+	}
+
+	int low_index = p_from_index; // Highest index known to be in view (the point we're at counts).
+	int high_index = p_last_index; // Lowest index known to be out of view.
+	int gap = 1;
+	while (low_index + gap < high_index) {
+		const int probe_index = low_index + gap;
+		if (_has_line_of_sight_between_points(p_window_opaque, p_side, p_from, p_points[probe_index])) {
+			low_index = probe_index;
+			gap *= 2;
+		} else {
+			high_index = probe_index;
+			break;
+		}
+	}
+
+	while (high_index - low_index > 1) {
+		const int middle_index = (low_index + high_index) / 2;
+		if (_has_line_of_sight_between_points(p_window_opaque, p_side, p_from, p_points[middle_index])) {
+			low_index = middle_index;
+		} else {
+			high_index = middle_index;
+		}
+	}
+
+	return low_index;
+}
+
+// Pulls the flood path from the start point to the emitter's end cell taut, like a string wrapped around the corridor's
+// corners: from each point it skips to the farthest path cell center still in view, which becomes the next bend. The
+// string is pinned to the center of every terrain cell the path goes through, so it's pulled taut between them and never
+// cuts through terrain the path didn't: a sound through a floor is heard from where it comes through the floor.
+// The path is followed through the parents from the end cell's layered index, whichever layers it runs through.
+// Returns the window index of the first bend, or -1 when the end point is in view from the start, and the string's
+// length in cells in r_length. Bends are cell centers, so they sit half a cell inside the real corners.
+static int _pull_string(LocalVector<int32_t> &r_chain, LocalVector<ResolvePoint> &r_points, LocalVector<int32_t> &r_pins, const uint8_t *p_window_opaque, const uint8_t *p_window_solid, const int32_t *p_parents, int p_side, int p_cell_count, const ResolvePoint &p_start, const ResolvePoint &p_end, int p_end_layered_index, double &r_length) {
+	// The flood path as points, origin first, ending at the emitter itself.
+	r_chain.clear();
+	for (int walk = p_end_layered_index; walk != AcousticFlood::UNREACHED; walk = p_parents[walk]) {
+		r_chain.push_back(walk % p_cell_count);
+	}
+
+	r_chain.reverse();
+	const int point_count = r_chain.size() + 1;
+	r_points.resize(point_count);
+	r_pins.clear();
+	for (int chain_index = 0; chain_index < (int)r_chain.size(); chain_index++) {
+		const int index = r_chain[chain_index];
+		r_points[chain_index] = ResolvePoint(index % p_side + 0.5, index / p_side + 0.5);
+		if (p_window_solid[index]) {
+			r_pins.push_back(chain_index); // The path's first and last cells are open air, so a pin is never either end.
+		}
+	}
+
+	r_points[point_count - 1] = p_end;
+
+	r_length = 0.0;
+	int first_bend_index = -1;
+	ResolvePoint current_point = p_start;
+	int current_index = 0; // Point index we're pulling from, the origin's cell to begin with (which holds the start point).
+	const int last_index = point_count - 1;
+	int pin_cursor = 0; // Index into the pins of the next pin ahead of current_index.
+	while (current_index < last_index) {
+		// Pull up to the next pin at most, as the string can't skip past the terrain it goes through. Its cell is the walk's
+		// end cell, which the line of sight walk never minds, and the start cell of the next stretch, which it never minds either.
+		while (pin_cursor < (int)r_pins.size() && r_pins[pin_cursor] <= current_index) {
+			pin_cursor++;
+		}
+
+		const int stretch_end_index = pin_cursor < (int)r_pins.size() ? r_pins[pin_cursor] : last_index;
+		int farthest_index = _farthest_visible_point(r_points, p_window_opaque, p_side, current_point, current_index, stretch_end_index);
+		if (farthest_index <= current_index) {
+			// Neighbouring path cells always see each other unless the next is a blocker, which is opaque but passable, so the
+			// string bends at it: sound through a closed door is heard from the door. Or the start point just sits awkwardly in its cell.
+			farthest_index = current_index + 1;
+		}
+
+		const ResolvePoint bend_point = r_points[farthest_index];
+		r_length += current_point.distance_to(bend_point);
+		if (first_bend_index == -1 && farthest_index < last_index) {
+			first_bend_index = r_chain[farthest_index];
+		}
+
+		current_point = bend_point;
+		current_index = farthest_index;
+	}
+
+	return first_bend_index;
+}
+
+// Resolves each emitter against one route's layer of a flooded field: its open cell, whether sound gets there that way,
+// and if so the taut path's length and first bend (see _pull_string()), which is where its sound appears from, and the
+// occlusion the material and blockers (closed doors) it goes through add up to. Points are in continuous window cell
+// coordinates: a point's cell is its floor and cell centers lie at .5.
+Dictionary AcousticFlood::resolve(const Dictionary &p_field, int p_layer_offset, int p_window_side, float p_cell_size, const PackedVector2Array &p_seed_window_cells, const Vector2i &p_window_origin_cell, const Vector2 &p_player_point, const PackedVector2Array &p_emitter_points, const Dictionary &p_costs) {
+	Dictionary result;
+	const int side = p_window_side;
+	const int cell_count = side * side;
+	ERR_FAIL_COND_V_MSG(side <= 0, result, "The window side must be positive.");
+	ERR_FAIL_COND_V_MSG(p_seed_window_cells.is_empty(), result, "At least one seed is needed.");
+	const PackedByteArray window_solid_array = p_field.get("window_solid", PackedByteArray());
+	const PackedByteArray window_opaque_array = p_field.get("window_opaque", PackedByteArray());
+	const PackedInt32Array distances_array = p_field.get("distances", PackedInt32Array());
+	const PackedInt32Array parents_array = p_field.get("parents", PackedInt32Array());
+	const PackedByteArray blocker_occlusions_array = p_field.get("blocker_occlusions", PackedByteArray());
+	const PackedInt32Array material_costs_array = p_field.get("material_costs", PackedInt32Array());
+	const PackedInt32Array surcharges_array = p_field.get("surcharges", PackedInt32Array());
+	const int layered_count = cell_count * ROUTE_COUNT;
+	ERR_FAIL_COND_V_MSG(window_solid_array.size() != cell_count || window_opaque_array.size() != cell_count, result, "The field's window masks don't match the window side.");
+	ERR_FAIL_COND_V_MSG(distances_array.size() != layered_count || parents_array.size() != layered_count || blocker_occlusions_array.size() != layered_count || material_costs_array.size() != layered_count || surcharges_array.size() != layered_count, result, "The field's arrays don't match the window side, or aren't a flood() result.");
+	ERR_FAIL_COND_V_MSG(p_layer_offset < 0 || p_layer_offset + cell_count > layered_count, result, "The layer offset lies outside the field.");
+	const uint8_t *window_solid = window_solid_array.ptr();
+	const uint8_t *window_opaque = window_opaque_array.ptr();
+	const int32_t *distances = distances_array.ptr();
+	const int32_t *parents = parents_array.ptr();
+	const uint8_t *blocker_occlusions = blocker_occlusions_array.ptr();
+	const int32_t *material_costs = material_costs_array.ptr();
+	const int32_t *surcharges = surcharges_array.ptr();
+
+	const double cell_size = p_cell_size;
+	const double max_attenuation_distance = _get_cost_double(p_costs, "max_attenuation_distance", 1700.0); // Px, emitters further as the crow flies are out of range.
+	const double wall_cost = _get_cost(p_costs, "wall_cost", 400); // Tenths of a cell a wall is worth: a route longer than the straight line plus this seals.
+	const double material_occlusion_full_cost = _get_cost_double(p_costs, "material_occlusion_full_cost", 200.0); // Tenths of a cell of material cost at which material alone occludes fully.
+	const int snap_max_ring = _get_cost(p_costs, "snap_max_ring", 2); // Rings of cells around a solid cell searched for open air to resolve from.
+	const double cell_inset = _get_cost_double(p_costs, "cell_inset", 0.01); // Cells, how far inside its cell a string's end is kept so it never sits on the edge.
+
+	const int emitter_count = p_emitter_points.size();
+	PackedByteArray emitter_states;
+	emitter_states.resize(emitter_count);
+	uint8_t *states = emitter_states.ptrw();
+	PackedVector2Array emitter_cells;
+	emitter_cells.resize(emitter_count);
+	Vector2 *cells = emitter_cells.ptrw();
+	PackedFloat32Array emitter_costs;
+	emitter_costs.resize(emitter_count);
+	float *costs = emitter_costs.ptrw();
+	PackedFloat32Array emitter_path_distances;
+	emitter_path_distances.resize(emitter_count);
+	float *path_distances = emitter_path_distances.ptrw();
+	PackedFloat32Array emitter_straight_distances;
+	emitter_straight_distances.resize(emitter_count);
+	float *straight_distances = emitter_straight_distances.ptrw();
+	PackedVector2Array emitter_opening_cells;
+	emitter_opening_cells.resize(emitter_count);
+	Vector2 *opening_cells = emitter_opening_cells.ptrw();
+	PackedFloat32Array emitter_occlusions;
+	emitter_occlusions.resize(emitter_count);
+	float *occlusions = emitter_occlusions.ptrw();
+
+	// Strings start where the player stands, unless that's inside terrain (just inside a floor or a wall): then at
+	// the spot nearest them of the exit cell each emitter's path came out of (its seed), the floor's face right above or the
+	// wall's face on that emitter's side, plus the short hop to them. Standing in a door's cells is fine, the line of sight
+	// walk never minds its own start cell. A player outside the window starts from the first seed's center.
+	const ResolvePoint player_point(p_player_point.x, p_player_point.y);
+	const int player_cell_x = (int)Math::floor(player_point.x);
+	const int player_cell_y = (int)Math::floor(player_point.y);
+	const bool player_in_window = player_cell_x >= 0 && player_cell_y >= 0 && player_cell_x < side && player_cell_y < side;
+	const bool player_in_terrain = player_in_window && window_solid[player_cell_y * side + player_cell_x] != 0;
+	const ResolvePoint first_seed_center(p_seed_window_cells[0].x + 0.5, p_seed_window_cells[0].y + 0.5);
+	const ResolvePoint straight_from_point = player_in_window ? player_point : first_seed_center;
+
+	LocalVector<int32_t> chain;
+	LocalVector<ResolvePoint> points;
+	LocalVector<int32_t> pins;
+	const Vector2 *emitter_points = p_emitter_points.ptr();
+	for (int emitter_index = 0; emitter_index < emitter_count; emitter_index++) {
+		const ResolvePoint emitter_point(emitter_points[emitter_index].x, emitter_points[emitter_index].y);
+		const int window_x = (int)Math::floor(emitter_point.x);
+		const int window_y = (int)Math::floor(emitter_point.y);
+		const Vector2 raw_cell(p_window_origin_cell.x + window_x, p_window_origin_cell.y + window_y);
+		const double straight_distance = MAX(straight_from_point.distance_to(emitter_point) * cell_size, cell_size); // Floored at one cell so sharing the player's spot isn't a division by zero.
+		states[emitter_index] = EMITTER_OUT_OF_RANGE;
+		cells[emitter_index] = raw_cell;
+		costs[emitter_index] = Math::INF;
+		path_distances[emitter_index] = Math::INF;
+		straight_distances[emitter_index] = (float)straight_distance;
+		opening_cells[emitter_index] = raw_cell;
+		occlusions[emitter_index] = 0.0f;
+		if (straight_distance > max_attenuation_distance || window_x < 0 || window_y < 0 || window_x >= side || window_y >= side) {
+			continue;
+		}
+
+		// Resolve from the open air next to the emitter when it sits in a solid cell, like the player does when standing on a floor.
+		const int index = _snap_to_open_window_index(window_solid, side, emitter_point, straight_from_point, snap_max_ring);
+		if (index == -1) {
+			states[emitter_index] = EMITTER_SEALED;
+			continue;
+		}
+
+		// A sound from inside a blocker's cells is the door's own (or something's in the doorway): it passes through those cells
+		// freely, to either side, so for it only terrain stands in the way of the string.
+		const bool emitter_in_blocker = window_opaque[index] != 0;
+		const uint8_t *line_of_sight_mask = emitter_in_blocker ? window_solid : window_opaque;
+
+		const int snapped_x = index % side;
+		const int snapped_y = index / side;
+		cells[emitter_index] = Vector2(p_window_origin_cell.x + snapped_x, p_window_origin_cell.y + snapped_y);
+
+		// No route this way, or none better than a wall: sealed either way, so nothing jumps at the flood's edge. Routes are
+		// compared with their material and blocker costs in, the same way the flood chose between them, against the straight
+		// line plus the wall's cost. The flood's distances run a little longer than the taut path, which is close enough here.
+		const int layered_index = index + p_layer_offset;
+		const double wall_cost_distance = straight_distance + wall_cost * 0.1 * cell_size;
+		if (distances[layered_index] == UNREACHED || distances[layered_index] * 0.1 * cell_size > wall_cost_distance) {
+			states[emitter_index] = EMITTER_SEALED;
+			continue;
+		}
+
+		// What the sound went through to get here muffles it: material at its cost, doors at their own, together at most fully.
+		const double blocker_occlusion = (blocker_occlusions[layered_index] & BLOCKER_OCCLUSION_MASK) / (double)BLOCKER_OCCLUSION_MASK;
+		const double occlusion = MIN(blocker_occlusion + material_costs[layered_index] / material_occlusion_full_cost, 1.0);
+
+		// Likewise the string ends at the emitter itself, unless it sits inside terrain: then at the spot of its open cell nearest
+		// it, the floor's face above it, plus the short hop into the floor.
+		const bool snapped_away = snapped_x != window_x || snapped_y != window_y;
+		const ResolvePoint end_point = snapped_away ? _clamp_into_cell(emitter_point, snapped_x, snapped_y, cell_inset) : emitter_point;
+
+		// This emitter's exit: the root of its path, which for a through cell lies back in the around layer.
+		int root_layered_index = layered_index;
+		while (parents[root_layered_index] != UNREACHED) {
+			root_layered_index = parents[root_layered_index];
+		}
+
+		const int root_index = root_layered_index % cell_count;
+		const int root_x = root_index % side;
+		const int root_y = root_index / side;
+		ResolvePoint start_point(root_x + 0.5, root_y + 0.5);
+		if (player_in_window) {
+			start_point = player_in_terrain ? _clamp_into_cell(player_point, root_x, root_y, cell_inset) : player_point;
+		}
+
+		const double start_hop = start_point.distance_to(straight_from_point);
+		double string_length = 0.0;
+		const int first_bend_index = _pull_string(chain, points, pins, line_of_sight_mask, window_solid, parents, side, cell_count, start_point, end_point, layered_index, string_length);
+		states[emitter_index] = EMITTER_REACHED;
+		occlusions[emitter_index] = (float)occlusion;
+		const double path_distance = (start_hop + string_length + end_point.distance_to(emitter_point)) * cell_size;
+		path_distances[emitter_index] = (float)path_distance;
+		costs[emitter_index] = (float)(path_distance + surcharges[layered_index] * 0.1 * cell_size); // The taut way there plus what's charged on it.
+		if (first_bend_index != -1) {
+			opening_cells[emitter_index] = Vector2(p_window_origin_cell.x + first_bend_index % side, p_window_origin_cell.y + first_bend_index / side);
+		}
+	}
+
+	result["emitter_states"] = emitter_states;
+	result["emitter_cells"] = emitter_cells;
+	result["emitter_costs"] = emitter_costs;
+	result["emitter_path_distances"] = emitter_path_distances;
+	result["emitter_straight_distances"] = emitter_straight_distances;
+	result["emitter_opening_cells"] = emitter_opening_cells;
+	result["emitter_occlusions"] = emitter_occlusions;
+	return result;
+}
+
 void AcousticFlood::_bind_methods() {
 	ClassDB::bind_static_method("AcousticFlood", D_METHOD("flood", "solid_cells", "cell_weights", "row_length", "row_amount", "window_origin_cell", "window_side", "seed_window_cells", "player_point", "blocked_cells", "blocked_costs", "blocked_occlusions", "costs"), &AcousticFlood::flood);
+	ClassDB::bind_static_method("AcousticFlood", D_METHOD("resolve", "field", "layer_offset", "window_side", "cell_size", "seed_window_cells", "window_origin_cell", "player_point", "emitter_points", "costs"), &AcousticFlood::resolve);
 
 	BIND_CONSTANT(UNREACHED);
 	BIND_CONSTANT(NOT_BLOCKED);
@@ -323,4 +710,7 @@ void AcousticFlood::_bind_methods() {
 	BIND_CONSTANT(ROUTE_AROUND);
 	BIND_CONSTANT(ROUTE_THROUGH);
 	BIND_CONSTANT(ROUTE_COUNT);
+	BIND_CONSTANT(EMITTER_OUT_OF_RANGE);
+	BIND_CONSTANT(EMITTER_SEALED);
+	BIND_CONSTANT(EMITTER_REACHED);
 }
