@@ -5100,6 +5100,27 @@ bool Main::iteration() {
 	NavigationServer3D::get_singleton()->process(process_step * time_scale);
 #endif // NAVIGATION_3D_DISABLED
 
+	// With an FPS cap, wait for the frame's time slot here, before the draw is handed to the
+	// renderer, instead of after it. The main thread's work varies per frame (e.g. when the physics
+	// tick rate is below the frame rate, physics only runs on some frames), so pushing the draw as soon as the work
+	// is done and waiting afterwards presents frames at uneven intervals, even though the main loop
+	// itself runs at a steady cadence. Waiting first means the draw starts at the same point of every
+	// frame, and the next iteration begins right after the push. The previous frame's draw can still
+	// overlap the wait, as the sync comes after it.
+	// Low processor usage mode (and the editor) keeps the wait at the end of the iteration, since
+	// there it is a CPU saver and waiting before the draw would delay redraws after input.
+	bool paced_before_draw = false;
+	uint64_t pacing_ticks = 0;
+	if (fixed_fps == -1 && Engine::get_singleton()->get_max_fps() > 0 && !Engine::get_singleton()->is_editor_hint() && !OS::get_singleton()->is_in_low_processor_usage_mode()) {
+		GodotProfileZoneGrouped(_profile_zone, "OS::add_frame_delay");
+		const uint64_t pacing_begin = OS::get_singleton()->get_ticks_usec();
+		SceneTree *scene_tree = SceneTree::get_singleton();
+		bool wake_for_events = scene_tree && scene_tree->is_accessibility_enabled();
+		OS::get_singleton()->add_frame_delay(DisplayServer::get_singleton()->window_can_draw(), wake_for_events);
+		pacing_ticks = OS::get_singleton()->get_ticks_usec() - pacing_begin;
+		paced_before_draw = true;
+	}
+
 	GodotProfileZoneGrouped(_profile_zone, "RenderingServer::sync");
 	RenderingServer::get_singleton()->sync(); //sync if still drawing from previous frames.
 
@@ -5127,9 +5148,10 @@ bool Main::iteration() {
 		}
 	}
 
-	process_ticks = OS::get_singleton()->get_ticks_usec() - process_begin;
+	// The wait for the frame's time slot is not work, so keep it out of the timings.
+	process_ticks = OS::get_singleton()->get_ticks_usec() - process_begin - pacing_ticks;
 	process_max = MAX(process_ticks, process_max);
-	uint64_t frame_time = OS::get_singleton()->get_ticks_usec() - ticks;
+	uint64_t frame_time = OS::get_singleton()->get_ticks_usec() - ticks - pacing_ticks;
 
 	GodotProfileZoneGrouped(_profile_zone, "GDExtensionManager::frame");
 	GDExtensionManager::get_singleton()->frame();
@@ -5202,11 +5224,13 @@ bool Main::iteration() {
 		return exit;
 	}
 
-	SceneTree *scene_tree = SceneTree::get_singleton();
-	bool wake_for_events = scene_tree && scene_tree->is_accessibility_enabled();
+	if (!paced_before_draw) {
+		SceneTree *scene_tree = SceneTree::get_singleton();
+		bool wake_for_events = scene_tree && scene_tree->is_accessibility_enabled();
 
-	GodotProfileZoneGrouped(_profile_zone, "OS::add_frame_delay");
-	OS::get_singleton()->add_frame_delay(DisplayServer::get_singleton()->window_can_draw(), wake_for_events);
+		GodotProfileZoneGrouped(_profile_zone, "OS::add_frame_delay");
+		OS::get_singleton()->add_frame_delay(DisplayServer::get_singleton()->window_can_draw(), wake_for_events);
+	}
 
 #ifdef TOOLS_ENABLED
 	if (auto_build_solutions) {
