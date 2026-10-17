@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="AcousticFlood" inherits="Object" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Two-layer distance field flood over a grid of terrain cells, for sound propagation.
+	</brief_description>
+	<description>
+		Floods a window of a baked grid of terrain cells from a set of seed cells, in two layers: paths that have gone through nothing yet (the around route) and paths that have gone through terrain that costs anything or a blocker (the through route). Terrain is passable at a cost scaled by the cell's weight, blockers (closed doors) at their own cost, charged once per full crossing. The caller keeps the grid and everything that reads the result; only the flood lives here, for speed.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="flood" qualifiers="static">
+			<return type="Dictionary" />
+			<param index="0" name="solid_cells" type="PackedByteArray" />
+			<param index="1" name="cell_weights" type="PackedByteArray" />
+			<param index="2" name="row_length" type="int" />
+			<param index="3" name="row_amount" type="int" />
+			<param index="4" name="window_origin_cell" type="Vector2i" />
+			<param index="5" name="window_side" type="int" />
+			<param index="6" name="seed_window_cells" type="PackedVector2Array" />
+			<param index="7" name="player_point" type="Vector2" />
+			<param index="8" name="blocked_cells" type="PackedVector2Array" />
+			<param index="9" name="blocked_costs" type="PackedInt32Array" />
+			<param index="10" name="blocked_occlusions" type="PackedByteArray" />
+			<param index="11" name="costs" type="Dictionary" />
+			<description>
+				Floods the square window of [param window_side] cells a side whose top left grid cell is [param window_origin_cell], over a grid of [param row_length] by [param row_amount] cells given as one byte per cell in [param solid_cells] (non-zero for solid) and [param cell_weights] (0 to [constant WEIGHT_FULL], how much a solid cell costs to enter; empty counts every solid cell as full). Cells outside the grid are open air.
+				The flood starts from [param seed_window_cells], in window cell coordinates, each at its distance from [param player_point], in continuous window cell coordinates. [param blocked_cells] are grid cells covered by blockers, each with a cost in [param blocked_costs] and an occlusion in [param blocked_occlusions] (0 to [constant BLOCKER_OCCLUSION_MASK]).
+				[param costs] tunes the flood, in tenths of a cell: [code]cost_orthogonal[/code], [code]cost_diagonal[/code], [code]max_distance[/code], [code]material_cost[/code], [code]material_cost_max[/code], [code]blocker_cost_max[/code], [code]wall_cost[/code], [code]through_dominance_margin[/code] and [code]seal_prune_margin[/code].
+				Returns a dictionary of arrays over both layers, the around layer's cells first and the through layer's after them at an offset of the window's cell count: [code]distances[/code] and [code]parents[/code] (window layered indices, [constant UNREACHED] where the flood didn't get), [code]blocker_occlusions[/code] (one byte per cell, occlusion plus [constant BLOCKER_PENDING_BIT] mid-crossing), [code]material_costs[/code] and [code]surcharges[/code] (how much of the distance is material entered, and material plus blockers), and over the window's cells only, [code]window_solid[/code] and [code]window_opaque[/code] (solid, or solid or blocked).
+			</description>
+		</method>
+	</methods>
+	<constants>
+		<constant name="UNREACHED" value="-1">
+			Distance and parent of cells the flood didn't reach.
+		</constant>
+		<constant name="NOT_BLOCKED" value="-1">
+			Blocker cost of cells no blocker covers.
+		</constant>
+		<constant name="BLOCKER_PENDING_BIT" value="128">
+			Set in a cell's blocker occlusion byte while its path is inside a blocker it entered from open air.
+		</constant>
+		<constant name="BLOCKER_OCCLUSION_MASK" value="127">
+			The occlusion itself in a cell's blocker occlusion byte.
+		</constant>
+		<constant name="WEIGHT_FULL" value="255">
+			Weight of a cell full of the hardest material, which costs the full material cost to enter.
+		</constant>
+		<constant name="ROUTE_AROUND" value="0">
+			The flood's first layer: paths that went through nothing yet.
+		</constant>
+		<constant name="ROUTE_THROUGH" value="1">
+			The flood's second layer: paths that went through terrain or a blocker.
+		</constant>
+		<constant name="ROUTE_COUNT" value="2">
+			How many layers the flood has.
+		</constant>
+	</constants>
+</class>
