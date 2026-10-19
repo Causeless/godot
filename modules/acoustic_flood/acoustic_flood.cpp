@@ -566,9 +566,10 @@ Dictionary AcousticFlood::resolve(const Dictionary &p_field, int p_layer_offset,
 	const double cell_size = p_cell_size;
 	const double max_attenuation_distance = _get_cost_double(p_costs, "max_attenuation_distance", 1700.0); // Px, emitters further as the crow flies are out of range.
 	const double wall_cost = _get_cost(p_costs, "wall_cost", 400); // Tenths of a cell a wall is worth: a route longer than the straight line plus this seals.
-	const double material_occlusion_full_cost = _get_cost_double(p_costs, "material_occlusion_full_cost", 200.0); // Tenths of a cell of material cost at which material alone occludes fully.
+	const double material_occlusion_halving_cost = _get_cost_double(p_costs, "material_occlusion_halving_cost", 120.0); // Tenths of a cell of material cost that halve what's left of the sound.
 	const int snap_max_ring = _get_cost(p_costs, "snap_max_ring", 2); // Rings of cells around a solid cell searched for open air to resolve from.
 	const double cell_inset = _get_cost_double(p_costs, "cell_inset", 0.01); // Cells, how far inside its cell a string's end is kept so it never sits on the edge.
+	ERR_FAIL_COND_V_MSG(material_occlusion_halving_cost <= 0.0, result, "The material occlusion halving cost must be positive.");
 
 	const int emitter_count = p_emitter_points.size();
 	PackedByteArray emitter_states;
@@ -652,9 +653,12 @@ Dictionary AcousticFlood::resolve(const Dictionary &p_field, int p_layer_offset,
 			continue;
 		}
 
-		// What the sound went through to get here muffles it: material at its cost, doors at their own, together at most fully.
+		// What the sound went through to get here muffles it: doors at their own occlusion, and material by halving what's left
+		// of the sound every material_occlusion_halving_cost. A share rather than a fixed amount per cost, so each unit of cost
+		// muffles alike however much came before, and the two combine by multiplying what each leaves.
 		const double blocker_occlusion = (blocker_occlusions[layered_index] & BLOCKER_OCCLUSION_MASK) / (double)BLOCKER_OCCLUSION_MASK;
-		const double occlusion = MIN(blocker_occlusion + material_costs[layered_index] / material_occlusion_full_cost, 1.0);
+		const double material_clarity = Math::pow(0.5, material_costs[layered_index] / material_occlusion_halving_cost);
+		const double occlusion = 1.0 - (1.0 - blocker_occlusion) * material_clarity;
 
 		// Likewise the string ends at the emitter itself, unless it sits inside terrain: then at the spot of its open cell nearest
 		// it, the floor's face above it, plus the short hop into the floor.
