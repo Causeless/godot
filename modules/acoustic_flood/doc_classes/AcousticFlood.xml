@@ -4,7 +4,7 @@
 		Two-layer distance field flood over a grid of terrain cells, for sound propagation.
 	</brief_description>
 	<description>
-		Floods a window of a baked grid of terrain cells from a set of seed cells, in two layers: paths that have gone through nothing yet (the around route) and paths that have gone through terrain that costs anything or a blocker (the through route). Terrain is passable at a cost scaled by the cell's weight, blockers (closed doors) at their own cost, charged once per full crossing. The caller keeps the grid and everything that reads the result; only the flood lives here, for speed.
+		Floods a window of a baked grid of terrain cells from a set of seed cells, in two layers: paths that have gone through nothing yet (the around route) and paths that have gone through terrain that costs anything or a blocker (the through route). Terrain is passable at a cost scaled by the cell's weight, blockers at their own cost, charged once as a path leaves their cells for open air. The caller keeps the grid and everything that reads the result; only the flood lives here, for speed.
 	</description>
 	<tutorials>
 	</tutorials>
@@ -21,13 +21,12 @@
 			<param index="7" name="player_point" type="Vector2" />
 			<param index="8" name="blocked_cells" type="PackedVector2Array" />
 			<param index="9" name="blocked_costs" type="PackedInt32Array" />
-			<param index="10" name="blocked_occlusions" type="PackedByteArray" />
-			<param index="11" name="costs" type="Dictionary" />
+			<param index="10" name="costs" type="Dictionary" />
 			<description>
 				Floods the square window of [param window_side] cells a side whose top left grid cell is [param window_origin_cell], over a grid of [param row_length] by [param row_amount] cells given as one byte per cell in [param solid_cells] (non-zero for solid) and [param cell_weights] (0 to [constant WEIGHT_FULL], how much a solid cell costs to enter; empty counts every solid cell as full). Cells outside the grid are open air.
-				The flood starts from [param seed_window_cells], in window cell coordinates, each at its distance from [param player_point], in continuous window cell coordinates. [param blocked_cells] are grid cells covered by blockers, each with a cost in [param blocked_costs] and an occlusion in [param blocked_occlusions] (0 to [constant BLOCKER_OCCLUSION_MASK]).
+				The flood starts from [param seed_window_cells], in window cell coordinates, each at its distance from [param player_point], in continuous window cell coordinates. [param blocked_cells] are grid cells covered by blockers, each with a cost in [param blocked_costs] (tenths of a cell, capped at [code]blocker_cost_max[/code]), which also sets how much crossing it occludes, see [method resolve].
 				[param costs] tunes the flood, in tenths of a cell: [code]cost_orthogonal[/code], [code]cost_diagonal[/code], [code]max_distance[/code], [code]material_cost[/code], [code]material_cost_max[/code], [code]blocker_cost_max[/code], [code]wall_cost[/code], [code]through_dominance_margin[/code] and [code]seal_prune_margin[/code].
-				Returns a dictionary of arrays over both layers, the around layer's cells first and the through layer's after them at an offset of the window's cell count: [code]distances[/code] and [code]parents[/code] (window layered indices, [constant UNREACHED] where the flood didn't get), [code]blocker_occlusions[/code] (one byte per cell, occlusion plus [constant BLOCKER_PENDING_BIT] mid-crossing), [code]material_costs[/code] and [code]surcharges[/code] (how much of the distance is material entered, and material plus blockers), and over the window's cells only, [code]window_solid[/code] and [code]window_opaque[/code] (solid, or solid or blocked). The dictionary is what [method resolve] takes as its field.
+				Returns a dictionary of arrays over both layers, the around layer's cells first and the through layer's after them at an offset of the window's cell count: [code]distances[/code] and [code]parents[/code] (window layered indices, [constant UNREACHED] where the flood didn't get) and [code]surcharges[/code] (how much of the distance is material entered and blockers crossed rather than travel), and over the window's cells only, [code]window_solid[/code] and [code]window_opaque[/code] (solid, or solid or blocked). The dictionary is what [method resolve] takes as its field.
 			</description>
 		</method>
 		<method name="resolve" qualifiers="static">
@@ -43,7 +42,7 @@
 			<param index="8" name="costs" type="Dictionary" />
 			<description>
 				Resolves each of [param emitter_points], in continuous window cell coordinates, against one layer of a [method flood] result [param field], the one starting at [param layer_offset]: whether sound reaches it that way and, if so, how far it travels along the taut path, the cell its sound last appears from on its way to the player and the occlusion it picks up. The window is [param window_side] cells a side with [param window_origin_cell] at its top left, each cell [param cell_size] px; strings are pulled from [param player_point] and the flood's [param seed_window_cells], all in window cell coordinates.
-				[param costs] takes [code]max_attenuation_distance[/code] (px), [code]wall_cost[/code] and [code]material_occlusion_halving_cost[/code] (tenths of a cell, positive), [code]snap_max_ring[/code] and [code]cell_inset[/code] (cells). An emitter's occlusion is [code]1 - (1 - blocker_occlusion) * 0.5 ^ (material_cost / material_occlusion_halving_cost)[/code]: every [code]material_occlusion_halving_cost[/code] of material crossed halves what's left of the sound, combined with the occlusion of the blockers crossed.
+				[param costs] takes [code]max_attenuation_distance[/code] (px), [code]wall_cost[/code] and [code]occlusion_halving_cost[/code] (tenths of a cell, positive), [code]snap_max_ring[/code] and [code]cell_inset[/code] (cells). An emitter's occlusion is [code]1 - 0.5 ^ (surcharge / occlusion_halving_cost)[/code]: every [code]occlusion_halving_cost[/code] of material and blocker cost on the way halves what's left of the sound.
 				Returns a dictionary of arrays, one entry per emitter: [code]emitter_states[/code] ([constant EMITTER_OUT_OF_RANGE], [constant EMITTER_SEALED] or [constant EMITTER_REACHED]), [code]emitter_cells[/code] (the open grid cell resolved from), [code]emitter_costs[/code] (px, the taut path plus what's charged on it, INF unless reached), [code]emitter_path_distances[/code] (px, INF unless reached), [code]emitter_straight_distances[/code] (px), [code]emitter_opening_cells[/code] (grid cell of the first bend, the emitter's own with a clear line) and [code]emitter_occlusions[/code] (0 to 1).
 			</description>
 		</method>
@@ -54,12 +53,6 @@
 		</constant>
 		<constant name="NOT_BLOCKED" value="-1">
 			Blocker cost of cells no blocker covers.
-		</constant>
-		<constant name="BLOCKER_PENDING_BIT" value="128">
-			Set in a cell's blocker occlusion byte while its path is inside a blocker it entered from open air.
-		</constant>
-		<constant name="BLOCKER_OCCLUSION_MASK" value="127">
-			The occlusion itself in a cell's blocker occlusion byte.
 		</constant>
 		<constant name="WEIGHT_FULL" value="255">
 			Weight of a cell full of the hardest material, which costs the full material cost to enter.

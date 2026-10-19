@@ -35,7 +35,7 @@
 #include "core/variant/dictionary.h"
 
 // A distance field flood for sound propagation: a two-layer Dial's algorithm flood over a window of a baked grid of
-// terrain cells, where terrain is passable at a cost and closed doors (blockers) at theirs. The caller keeps the grid,
+// terrain cells, where terrain is passable at a cost and blockers at theirs. The caller keeps the grid,
 // the window and everything that reads the result; this class only floods.
 class AcousticFlood : public Object {
 	GDCLASS(AcousticFlood, Object);
@@ -47,8 +47,6 @@ public:
 	enum {
 		UNREACHED = -1, // Distance and parent of cells the flood didn't reach.
 		NOT_BLOCKED = -1, // Blocker cost of cells no blocker covers.
-		BLOCKER_PENDING_BIT = 128, // Set in a cell's blocker occlusion byte while its path is inside a blocker it entered from open air.
-		BLOCKER_OCCLUSION_MASK = 127, // The occlusion itself in that byte.
 		WEIGHT_FULL = 255, // Weight of a cell full of the hardest material, which costs the full material cost to enter.
 		ROUTE_AROUND = 0, // The flood's first layer: paths that went through nothing yet.
 		ROUTE_THROUGH = 1, // Its second layer: paths that went through terrain or a blocker.
@@ -58,6 +56,6 @@ public:
 		EMITTER_REACHED = 2, // Sound gets there this way, see its path distance, opening and occlusion.
 	};
 
-	static Dictionary flood(const PackedByteArray &p_solid_cells, const PackedByteArray &p_cell_weights, int p_row_length, int p_row_amount, const Vector2i &p_window_origin_cell, int p_window_side, const PackedVector2Array &p_seed_window_cells, const Vector2 &p_player_point, const PackedVector2Array &p_blocked_cells, const PackedInt32Array &p_blocked_costs, const PackedByteArray &p_blocked_occlusions, const Dictionary &p_costs);
+	static Dictionary flood(const PackedByteArray &p_solid_cells, const PackedByteArray &p_cell_weights, int p_row_length, int p_row_amount, const Vector2i &p_window_origin_cell, int p_window_side, const PackedVector2Array &p_seed_window_cells, const Vector2 &p_player_point, const PackedVector2Array &p_blocked_cells, const PackedInt32Array &p_blocked_costs, const Dictionary &p_costs);
 	static Dictionary resolve(const Dictionary &p_field, int p_layer_offset, int p_window_side, float p_cell_size, const PackedVector2Array &p_seed_window_cells, const Vector2i &p_window_origin_cell, const Vector2 &p_player_point, const PackedVector2Array &p_emitter_points, const Dictionary &p_costs);
 };

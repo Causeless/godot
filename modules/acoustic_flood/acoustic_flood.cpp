@@ -53,12 +53,12 @@ static int _get_cost(const Dictionary &p_costs, const char *p_key, int p_default
 // Dial's algorithm: cells wait in a ring of buckets indexed by their distance, and are expanded in distance order like
 // Dijkstra, without a heap. Every edge cost is a small positive integer, so a ring one larger than the largest step
 // never holds two distances in one bucket.
-Dictionary AcousticFlood::flood(const PackedByteArray &p_solid_cells, const PackedByteArray &p_cell_weights, int p_row_length, int p_row_amount, const Vector2i &p_window_origin_cell, int p_window_side, const PackedVector2Array &p_seed_window_cells, const Vector2 &p_player_point, const PackedVector2Array &p_blocked_cells, const PackedInt32Array &p_blocked_costs, const PackedByteArray &p_blocked_occlusions, const Dictionary &p_costs) {
+Dictionary AcousticFlood::flood(const PackedByteArray &p_solid_cells, const PackedByteArray &p_cell_weights, int p_row_length, int p_row_amount, const Vector2i &p_window_origin_cell, int p_window_side, const PackedVector2Array &p_seed_window_cells, const Vector2 &p_player_point, const PackedVector2Array &p_blocked_cells, const PackedInt32Array &p_blocked_costs, const Dictionary &p_costs) {
 	Dictionary result;
 	const int side = p_window_side;
 	ERR_FAIL_COND_V_MSG(side <= 0, result, "The window side must be positive.");
 	ERR_FAIL_COND_V_MSG(p_row_length < 0 || p_row_amount < 0 || p_solid_cells.size() != (int64_t)p_row_length * p_row_amount, result, "The solid cells don't match the grid's row length and amount.");
-	ERR_FAIL_COND_V_MSG(p_blocked_costs.size() != p_blocked_cells.size() || p_blocked_occlusions.size() != p_blocked_cells.size(), result, "Every blocked cell needs a cost and an occlusion.");
+	ERR_FAIL_COND_V_MSG(p_blocked_costs.size() != p_blocked_cells.size(), result, "Every blocked cell needs a cost.");
 
 	// Costs in tenths of a cell, the flood's unit. Each can be overridden through p_costs.
 	const int cost_orthogonal = _get_cost(p_costs, "cost_orthogonal", 10); // Step to a side neighbour.
@@ -112,21 +112,17 @@ Dictionary AcousticFlood::flood(const PackedByteArray &p_solid_cells, const Pack
 		}
 	}
 
-	// Blockers (closed doors) can be passed through, each at its own price, and block line of sight like terrain.
+	// Blockers can be passed through, each at its own price, and block line of sight like terrain.
 	LocalVector<int32_t> window_blocker_cost;
 	window_blocker_cost.resize(cell_count);
-	LocalVector<uint8_t> window_blocker_occlusion;
-	window_blocker_occlusion.resize(cell_count);
 	for (int i = 0; i < cell_count; i++) {
 		window_blocker_cost[i] = NOT_BLOCKED;
-		window_blocker_occlusion[i] = 0;
 	}
 
 	PackedByteArray window_opaque = window_solid.duplicate();
 	uint8_t *opaque = window_opaque.ptrw();
 	const Vector2 *blocked_cells = p_blocked_cells.ptr();
 	const int32_t *blocked_costs = p_blocked_costs.ptr();
-	const uint8_t *blocked_occlusions = p_blocked_occlusions.ptr();
 	for (int blocked = 0; blocked < p_blocked_cells.size(); blocked++) {
 		const int window_x = (int)blocked_cells[blocked].x - p_window_origin_cell.x;
 		const int window_y = (int)blocked_cells[blocked].y - p_window_origin_cell.y;
@@ -136,7 +132,6 @@ Dictionary AcousticFlood::flood(const PackedByteArray &p_solid_cells, const Pack
 
 		const int blocked_index = window_y * side + window_x;
 		window_blocker_cost[blocked_index] = CLAMP(blocked_costs[blocked], 0, blocker_cost_max);
-		window_blocker_occlusion[blocked_index] = MIN(blocked_occlusions[blocked], (uint8_t)BLOCKER_OCCLUSION_MASK);
 		opaque[blocked_index] = 1;
 	}
 
@@ -149,14 +144,9 @@ Dictionary AcousticFlood::flood(const PackedByteArray &p_solid_cells, const Pack
 	parents.resize(layered_count);
 	parents.fill(UNREACHED);
 	int32_t *parent = parents.ptrw();
-	PackedByteArray blocker_occlusions;
-	blocker_occlusions.resize(layered_count);
-	uint8_t *labels = blocker_occlusions.ptrw();
-	memset(labels, 0, layered_count);
-	PackedInt32Array material_costs;
-	material_costs.resize(layered_count);
-	material_costs.fill(0);
-	int32_t *material = material_costs.ptrw();
+	LocalVector<int32_t> material; // Material cost the path to each cell carries, for material_cost_max.
+	material.resize(layered_count);
+	memset(material.ptr(), 0, layered_count * sizeof(int32_t));
 	PackedInt32Array surcharges;
 	surcharges.resize(layered_count);
 	surcharges.fill(0);
@@ -166,8 +156,8 @@ Dictionary AcousticFlood::flood(const PackedByteArray &p_solid_cells, const Pack
 	buckets.resize(bucket_count);
 
 	// Every seed starts at its true distance from the player, so a player inside a thin wall reaches both sides of it directly
-	// through whichever exit is nearer each thing. A seed in a blocker's cells counts as having entered it: a through cell with
-	// the crossing pending, so what's beyond stays behind the door and nothing is reached around.
+	// through whichever exit is nearer each thing. A seed in a blocker's cells counts as having entered it: a through cell
+	// that pays the blocker on leaving, so what's beyond stays behind the blocker and nothing is reached around.
 	int pending_count = 0; // Queued cells not yet expanded, including stale duplicates.
 	const Vector2 *seeds = p_seed_window_cells.ptr();
 	for (int seed = 0; seed < p_seed_window_cells.size(); seed++) {
@@ -177,7 +167,6 @@ Dictionary AcousticFlood::flood(const PackedByteArray &p_solid_cells, const Pack
 		int seed_layered_index = seed_y * side + seed_x;
 		if (window_blocker_cost[seed_layered_index] != NOT_BLOCKED) {
 			seed_layered_index += through_offset;
-			labels[seed_layered_index] = BLOCKER_PENDING_BIT;
 		}
 
 		const Vector2 exit_point = p_player_point.clamp(Vector2(seed_x, seed_y), Vector2(seed_x + 1, seed_y + 1));
@@ -238,24 +227,17 @@ Dictionary AcousticFlood::flood(const PackedByteArray &p_solid_cells, const Pack
 				const bool crossing = window_blocker_cost[neighbour_index] != NOT_BLOCKED || window_weights[neighbour_index] > 0;
 				const int neighbour_layered_index = (in_through || crossing) ? neighbour_index + through_offset : neighbour_index;
 
-				// A blocker is charged and its occlusion added once per full crossing: entering its cells from open air makes the
-				// crossing pending, leaving them for open air completes it, at the price of the cell just left. Paths starting or
-				// ending inside only ever do half a crossing, which is free.
-				int label = labels[layered_index];
+				// A blocker is charged once per crossing, as the path leaves its cells for open air, at the price of the cell just
+				// left: steps between its cells are free, and so is a path ending inside, while one starting inside pays on its way out.
 				int next_surcharge = surcharge[layered_index];
-				if (window_blocker_cost[neighbour_index] != NOT_BLOCKED) {
-					if (window_blocker_cost[index] == NOT_BLOCKED) {
-						label |= BLOCKER_PENDING_BIT;
-					}
-				} else if (label & BLOCKER_PENDING_BIT) {
-					label = MIN((label & BLOCKER_OCCLUSION_MASK) + window_blocker_occlusion[index], BLOCKER_OCCLUSION_MASK);
+				if (window_blocker_cost[index] != NOT_BLOCKED && window_blocker_cost[neighbour_index] == NOT_BLOCKED) {
 					next_distance += window_blocker_cost[index];
 					next_surcharge += window_blocker_cost[index];
 				}
 
-				// Terrain is entered at its weight's share of the material cost, which the path carries along as what it occludes
-				// by. A path carrying more than any unsealed route could bear stops entering material: everything beyond is sealed
-				// through it, and the flood would otherwise fill every thick mass in the window.
+				// Terrain is entered at its weight's share of the material cost, which the path carries along. A path carrying more
+				// than any unsealed route could bear stops entering material: everything beyond is sealed through it, and the flood
+				// would otherwise fill every thick mass in the window.
 				int next_material = material[layered_index];
 				if (solid[neighbour_index]) {
 					const int entry_cost = material_cost * window_weights[neighbour_index] / WEIGHT_FULL;
@@ -291,7 +273,6 @@ Dictionary AcousticFlood::flood(const PackedByteArray &p_solid_cells, const Pack
 
 				dist[neighbour_layered_index] = next_distance;
 				parent[neighbour_layered_index] = layered_index;
-				labels[neighbour_layered_index] = (uint8_t)label;
 				material[neighbour_layered_index] = next_material;
 				surcharge[neighbour_layered_index] = next_surcharge;
 				buckets[next_distance % bucket_count].push_back(neighbour_layered_index);
@@ -304,8 +285,6 @@ Dictionary AcousticFlood::flood(const PackedByteArray &p_solid_cells, const Pack
 
 	result["distances"] = distances;
 	result["parents"] = parents;
-	result["blocker_occlusions"] = blocker_occlusions;
-	result["material_costs"] = material_costs;
 	result["surcharges"] = surcharges;
 	result["window_solid"] = window_solid;
 	result["window_opaque"] = window_opaque;
@@ -517,7 +496,7 @@ static int _pull_string(LocalVector<int32_t> &r_chain, LocalVector<ResolvePoint>
 		int farthest_index = _farthest_visible_point(r_points, p_window_opaque, p_side, current_point, current_index, stretch_end_index);
 		if (farthest_index <= current_index) {
 			// Neighbouring path cells always see each other unless the next is a blocker, which is opaque but passable, so the
-			// string bends at it: sound through a closed door is heard from the door. Or the start point just sits awkwardly in its cell.
+			// string bends at it: sound through a blocker is heard from the blocker. Or the start point just sits awkwardly in its cell.
 			farthest_index = current_index + 1;
 		}
 
@@ -536,7 +515,7 @@ static int _pull_string(LocalVector<int32_t> &r_chain, LocalVector<ResolvePoint>
 
 // Resolves each emitter against one route's layer of a flooded field: its open cell, whether sound gets there that way,
 // and if so the taut path's length and first bend (see _pull_string()), which is where its sound appears from, and the
-// occlusion the material and blockers (closed doors) it goes through add up to. Points are in continuous window cell
+// occlusion the cost of the material and blockers it goes through adds up to. Points are in continuous window cell
 // coordinates: a point's cell is its floor and cell centers lie at .5.
 Dictionary AcousticFlood::resolve(const Dictionary &p_field, int p_layer_offset, int p_window_side, float p_cell_size, const PackedVector2Array &p_seed_window_cells, const Vector2i &p_window_origin_cell, const Vector2 &p_player_point, const PackedVector2Array &p_emitter_points, const Dictionary &p_costs) {
 	Dictionary result;
@@ -548,28 +527,24 @@ Dictionary AcousticFlood::resolve(const Dictionary &p_field, int p_layer_offset,
 	const PackedByteArray window_opaque_array = p_field.get("window_opaque", PackedByteArray());
 	const PackedInt32Array distances_array = p_field.get("distances", PackedInt32Array());
 	const PackedInt32Array parents_array = p_field.get("parents", PackedInt32Array());
-	const PackedByteArray blocker_occlusions_array = p_field.get("blocker_occlusions", PackedByteArray());
-	const PackedInt32Array material_costs_array = p_field.get("material_costs", PackedInt32Array());
 	const PackedInt32Array surcharges_array = p_field.get("surcharges", PackedInt32Array());
 	const int layered_count = cell_count * ROUTE_COUNT;
 	ERR_FAIL_COND_V_MSG(window_solid_array.size() != cell_count || window_opaque_array.size() != cell_count, result, "The field's window masks don't match the window side.");
-	ERR_FAIL_COND_V_MSG(distances_array.size() != layered_count || parents_array.size() != layered_count || blocker_occlusions_array.size() != layered_count || material_costs_array.size() != layered_count || surcharges_array.size() != layered_count, result, "The field's arrays don't match the window side, or aren't a flood() result.");
+	ERR_FAIL_COND_V_MSG(distances_array.size() != layered_count || parents_array.size() != layered_count || surcharges_array.size() != layered_count, result, "The field's arrays don't match the window side, or aren't a flood() result.");
 	ERR_FAIL_COND_V_MSG(p_layer_offset < 0 || p_layer_offset + cell_count > layered_count, result, "The layer offset lies outside the field.");
 	const uint8_t *window_solid = window_solid_array.ptr();
 	const uint8_t *window_opaque = window_opaque_array.ptr();
 	const int32_t *distances = distances_array.ptr();
 	const int32_t *parents = parents_array.ptr();
-	const uint8_t *blocker_occlusions = blocker_occlusions_array.ptr();
-	const int32_t *material_costs = material_costs_array.ptr();
 	const int32_t *surcharges = surcharges_array.ptr();
 
 	const double cell_size = p_cell_size;
 	const double max_attenuation_distance = _get_cost_double(p_costs, "max_attenuation_distance", 1700.0); // Px, emitters further as the crow flies are out of range.
 	const double wall_cost = _get_cost(p_costs, "wall_cost", 400); // Tenths of a cell a wall is worth: a route longer than the straight line plus this seals.
-	const double material_occlusion_halving_cost = _get_cost_double(p_costs, "material_occlusion_halving_cost", 120.0); // Tenths of a cell of material cost that halve what's left of the sound.
+	const double occlusion_halving_cost = _get_cost_double(p_costs, "occlusion_halving_cost", 120.0); // Tenths of a cell of material and blocker cost that halve what's left of the sound.
 	const int snap_max_ring = _get_cost(p_costs, "snap_max_ring", 2); // Rings of cells around a solid cell searched for open air to resolve from.
 	const double cell_inset = _get_cost_double(p_costs, "cell_inset", 0.01); // Cells, how far inside its cell a string's end is kept so it never sits on the edge.
-	ERR_FAIL_COND_V_MSG(material_occlusion_halving_cost <= 0.0, result, "The material occlusion halving cost must be positive.");
+	ERR_FAIL_COND_V_MSG(occlusion_halving_cost <= 0.0, result, "The occlusion halving cost must be positive.");
 
 	const int emitter_count = p_emitter_points.size();
 	PackedByteArray emitter_states;
@@ -596,7 +571,7 @@ Dictionary AcousticFlood::resolve(const Dictionary &p_field, int p_layer_offset,
 
 	// Strings start where the player stands, unless that's inside terrain (just inside a floor or a wall): then at
 	// the spot nearest them of the exit cell each emitter's path came out of (its seed), the floor's face right above or the
-	// wall's face on that emitter's side, plus the short hop to them. Standing in a door's cells is fine, the line of sight
+	// wall's face on that emitter's side, plus the short hop to them. Standing in a blocker's cells is fine, the line of sight
 	// walk never minds its own start cell. A player outside the window starts from the first seed's center.
 	const ResolvePoint player_point(p_player_point.x, p_player_point.y);
 	const int player_cell_x = (int)Math::floor(player_point.x);
@@ -634,7 +609,7 @@ Dictionary AcousticFlood::resolve(const Dictionary &p_field, int p_layer_offset,
 			continue;
 		}
 
-		// A sound from inside a blocker's cells is the door's own (or something's in the doorway): it passes through those cells
+		// A sound from inside a blocker's cells is the blocker's own (or something's within it): it passes through those cells
 		// freely, to either side, so for it only terrain stands in the way of the string.
 		const bool emitter_in_blocker = window_opaque[index] != 0;
 		const uint8_t *line_of_sight_mask = emitter_in_blocker ? window_solid : window_opaque;
@@ -653,12 +628,10 @@ Dictionary AcousticFlood::resolve(const Dictionary &p_field, int p_layer_offset,
 			continue;
 		}
 
-		// What the sound went through to get here muffles it: doors at their own occlusion, and material by halving what's left
-		// of the sound every material_occlusion_halving_cost. A share rather than a fixed amount per cost, so each unit of cost
-		// muffles alike however much came before, and the two combine by multiplying what each leaves.
-		const double blocker_occlusion = (blocker_occlusions[layered_index] & BLOCKER_OCCLUSION_MASK) / (double)BLOCKER_OCCLUSION_MASK;
-		const double material_clarity = Math::pow(0.5, material_costs[layered_index] / material_occlusion_halving_cost);
-		const double occlusion = 1.0 - (1.0 - blocker_occlusion) * material_clarity;
+		// What the sound went through to get here muffles it by what it cost: every occlusion_halving_cost of material and
+		// blockers on the way halves what's left of the sound. A share rather than a fixed amount per cost, so each unit of
+		// cost muffles alike however much came before.
+		const double occlusion = 1.0 - Math::pow(0.5, surcharges[layered_index] / occlusion_halving_cost);
 
 		// Likewise the string ends at the emitter itself, unless it sits inside terrain: then at the spot of its open cell nearest
 		// it, the floor's face above it, plus the short hop into the floor.
@@ -703,13 +676,11 @@ Dictionary AcousticFlood::resolve(const Dictionary &p_field, int p_layer_offset,
 }
 
 void AcousticFlood::_bind_methods() {
-	ClassDB::bind_static_method("AcousticFlood", D_METHOD("flood", "solid_cells", "cell_weights", "row_length", "row_amount", "window_origin_cell", "window_side", "seed_window_cells", "player_point", "blocked_cells", "blocked_costs", "blocked_occlusions", "costs"), &AcousticFlood::flood);
+	ClassDB::bind_static_method("AcousticFlood", D_METHOD("flood", "solid_cells", "cell_weights", "row_length", "row_amount", "window_origin_cell", "window_side", "seed_window_cells", "player_point", "blocked_cells", "blocked_costs", "costs"), &AcousticFlood::flood);
 	ClassDB::bind_static_method("AcousticFlood", D_METHOD("resolve", "field", "layer_offset", "window_side", "cell_size", "seed_window_cells", "window_origin_cell", "player_point", "emitter_points", "costs"), &AcousticFlood::resolve);
 
 	BIND_CONSTANT(UNREACHED);
 	BIND_CONSTANT(NOT_BLOCKED);
-	BIND_CONSTANT(BLOCKER_PENDING_BIT);
-	BIND_CONSTANT(BLOCKER_OCCLUSION_MASK);
 	BIND_CONSTANT(WEIGHT_FULL);
 	BIND_CONSTANT(ROUTE_AROUND);
 	BIND_CONSTANT(ROUTE_THROUGH);
