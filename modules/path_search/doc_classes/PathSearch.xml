@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="PathSearch" inherits="Object" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Weighted A* search over a graph of connections between nodes, for agents that walk between the points where they jump, climb or pass through something.
+	</brief_description>
+	<description>
+		Searches a graph whose nodes are areas an agent can move freely within and whose connections are the points where it leaves one node for another: a jump, a climb, a door. The search runs over connections rather than nodes, so what a connection costs to reach depends on where the one before it landed, and the agent's own position prices the first connections out of the start node.
+		The caller keeps the graph as packed arrays indexed by connection and node ids, built however it likes, and hands them over per call; only the search lives here, for speed. Packed arrays are copy-on-write, so a search keeps reading the arrays it was given even if the caller patches its own copies meanwhile, which makes [method find_path] safe to call from a worker thread.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="find_path" qualifiers="static">
+			<return type="Dictionary" />
+			<param index="0" name="graph" type="Dictionary" />
+			<param index="1" name="start_node" type="int" />
+			<param index="2" name="goal_node" type="int" />
+			<param index="3" name="actor_position" type="Vector2" />
+			<param index="4" name="actor_level" type="int" />
+			<param index="5" name="actor_key" type="int" />
+			<param index="6" name="goal_position" type="Vector2" />
+			<param index="7" name="costs" type="Dictionary" />
+			<param index="8" name="max_iterations" type="int" />
+			<param index="9" name="stop_at_step" type="int" />
+			<description>
+				Finds the cheapest known sequence of connections from [param start_node], where the actor stands at [param actor_position], to [param goal_node], heading for [param goal_position] within it.
+				[param graph] holds the connection arrays, all of one size, one entry per connection id: [code]connection_position[/code] ([PackedVector2Array], where the actor has to get to), [code]connection_landing[/code] ([PackedVector2Array], where it ends up after taking it), [code]connection_runup_x[/code] ([PackedFloat32Array], the x of the runup point) and [code]connection_runup_sign[/code] ([PackedInt32Array], the sign of the direction the connection has to be approached in, or 0 for none), [code]connection_cost[/code] ([PackedFloat64Array], the connection's own cost), [code]connection_level[/code] ([PackedByteArray], the ability level it requires), [code]connection_flags[/code] ([PackedByteArray], [constant CONNECTION_FLAG_ACTIVE], [constant CONNECTION_FLAG_CLOSED] and [constant CONNECTION_FLAG_LOCKED]), [code]connection_key[/code] ([PackedInt32Array], the key that opens it while locked), [code]connection_start_node[/code] and [code]connection_end_node[/code] ([PackedInt32Array], its node ids). It also holds the node arrays, one entry per node id: [code]node_active[/code] ([PackedByteArray], non-zero for nodes that can be passed through), [code]node_is_climb[/code] ([PackedByteArray], non-zero where reaching a connection also means climbing to its height), and node N's outgoing connection ids as [code]node_connection_ids[/code] ([PackedInt32Array]) from index [code]node_connection_begin[N][/code] up to [code]node_connection_begin[N + 1][/code] ([PackedInt32Array], one entry longer than the node count).
+				A connection is skipped unless it's active, leads into an active node and requires at most [param actor_level]. A closed and locked one is also skipped unless [param actor_key] is its key, and a key of [constant KEY_NONE] admits nobody. A connection leading straight back into the node the current one came from is never taken.
+				[param costs] tunes the search: [code]walk_cost_per_unit[/code] (what a unit of horizontal distance walked between connections costs), [code]heuristic_per_unit[/code] (what a unit of straight-line distance still to the goal counts for; more than the walk cost trades path quality for fewer iterations), [code]climb_vertical_mult[/code] (on a climb node, how many walked units a unit of height to the connection counts as), [code]heuristic_up_mult[/code] and [code]heuristic_down_mult[/code] (how much a unit of height still to climb or drop to the goal counts in the heuristic).
+				The search gives up after [param max_iterations] iterations. [param stop_at_step] makes it stop at that iteration and return the partial path to the connection it was about to expand, for stepping through a search; pass [constant NO_STOP] to run to the end.
+				Returns a dictionary with [code]path[/code] (a [PackedInt32Array] of connection ids in travel order, empty if there is no path, the search gave up or the start and goal nodes are the same), [code]steps[/code] (the iterations taken) and [code]edges[/code] (the outgoing connections looked at, over all iterations).
+			</description>
+		</method>
+	</methods>
+	<constants>
+		<constant name="CONNECTION_FLAG_ACTIVE" value="1">
+			Flag of a connection that can be taken at all. Connections without it are skipped outright.
+		</constant>
+		<constant name="CONNECTION_FLAG_CLOSED" value="2">
+			Flag of a connection that is shut, like a closed door. Anyone may open it unless it's also locked.
+		</constant>
+		<constant name="CONNECTION_FLAG_LOCKED" value="4">
+			Flag of a connection that, while closed, only an actor whose key matches the connection's may open.
+		</constant>
+		<constant name="KEY_NONE" value="0">
+			The key that opens nothing: a locked connection holding it admits nobody.
+		</constant>
+		<constant name="NO_STOP" value="-1">
+			Value of the stop step that lets a search run to its end.
+		</constant>
+	</constants>
+</class>
