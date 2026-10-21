@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="ArticulatedBody2D" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		A planar body of rigid parts joined by pin joints, simulated with substepped position based dynamics.
+	</brief_description>
+	<description>
+		Simulates rigid parts pinned together by joints as one articulated body, using extended position based dynamics with substeps. Each joint can be limited to a range of relative angles and driven toward a target relative angle with a compliance, so the body can hold a pose rigidly, follow one loosely or hang limp, joint by joint, and the drives can be retuned at any time. Positions are in whatever units the caller uses, rotations in radians.
+		The body stands on its own: it is not a node and touches neither the scene tree nor the physics server. The caller adds parts and joints, feeds targets and impulses, calls [method step] and reads the part transforms back, so a step can run from any thread that owns the body and substep as often as its stiffness needs, independently of the engine's physics tick.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="add_joint">
+			<return type="int" />
+			<param index="0" name="part_a" type="int" />
+			<param index="1" name="part_b" type="int" />
+			<param index="2" name="anchor_a" type="Vector2" />
+			<param index="3" name="anchor_b" type="Vector2" />
+			<description>
+				Pins [param part_a] and [param part_b] together at [param anchor_a] and [param anchor_b], each in its own part's local space. Returns the joint's index, or [code]-1[/code] if either part doesn't exist or both are the same. A new joint has no limits and no drive.
+			</description>
+		</method>
+		<method name="add_part">
+			<return type="int" />
+			<param index="0" name="position" type="Vector2" />
+			<param index="1" name="rotation" type="float" />
+			<param index="2" name="mass" type="float" />
+			<param index="3" name="inertia" type="float" />
+			<description>
+				Adds a rigid part at [param position] and [param rotation] with the given [param mass] and rotational [param inertia], at rest. A mass or inertia of zero or less makes that quantity infinite, so the part never moves or never turns. Returns the part's index.
+			</description>
+		</method>
+		<method name="apply_impulse">
+			<return type="void" />
+			<param index="0" name="part" type="int" />
+			<param index="1" name="impulse" type="Vector2" />
+			<param index="2" name="point" type="Vector2" />
+			<description>
+				Changes [param part]'s velocities as if [param impulse] hit it at [param point], in the body's space. Takes effect on the next [method step].
+			</description>
+		</method>
+		<method name="clear">
+			<return type="void" />
+			<description>
+				Removes every part and joint.
+			</description>
+		</method>
+		<method name="get_gravity" qualifiers="const">
+			<return type="Vector2" />
+			<description>
+				Returns the acceleration applied to every movable part each step.
+			</description>
+		</method>
+		<method name="get_joint_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns how many joints the body has.
+			</description>
+		</method>
+		<method name="get_part_angular_velocity" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="part" type="int" />
+			<description>
+				Returns [param part]'s angular velocity in radians per unit of time.
+			</description>
+		</method>
+		<method name="get_part_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns how many parts the body has.
+			</description>
+		</method>
+		<method name="get_part_linear_velocity" qualifiers="const">
+			<return type="Vector2" />
+			<param index="0" name="part" type="int" />
+			<description>
+				Returns [param part]'s linear velocity.
+			</description>
+		</method>
+		<method name="get_part_position" qualifiers="const">
+			<return type="Vector2" />
+			<param index="0" name="part" type="int" />
+			<description>
+				Returns [param part]'s position.
+			</description>
+		</method>
+		<method name="get_part_positions" qualifiers="const">
+			<return type="PackedVector2Array" />
+			<description>
+				Returns every part's position, by part index.
+			</description>
+		</method>
+		<method name="get_part_rotation" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="part" type="int" />
+			<description>
+				Returns [param part]'s rotation in radians.
+			</description>
+		</method>
+		<method name="get_part_rotations" qualifiers="const">
+			<return type="PackedFloat32Array" />
+			<description>
+				Returns every part's rotation in radians, by part index.
+			</description>
+		</method>
+		<method name="set_damping">
+			<return type="void" />
+			<param index="0" name="linear" type="float" />
+			<param index="1" name="angular" type="float" />
+			<description>
+				Sets how quickly linear and angular velocities decay, as the fraction lost per unit of time at low values. Negative values count as zero. Damping is applied implicitly, so any amount stays stable.
+			</description>
+		</method>
+		<method name="set_gravity">
+			<return type="void" />
+			<param index="0" name="gravity" type="Vector2" />
+			<description>
+				Sets the acceleration applied to every movable part each step.
+			</description>
+		</method>
+		<method name="set_joint_drive">
+			<return type="void" />
+			<param index="0" name="joint" type="int" />
+			<param index="1" name="target_angle" type="float" />
+			<param index="2" name="compliance" type="float" />
+			<description>
+				Makes [param joint] pull part b's rotation relative to part a toward [param target_angle], in radians, with the given [param compliance]: zero holds the angle rigidly, larger values let it give more under load, and a negative value switches the drive off. Compliance is in radians per unit of torque, so under a steady torque the joint settles about [code]compliance * torque[/code] away from its target; with masses and distances in the caller's units the useful values are correspondingly small. The target may change every step, which is how an animated pose drives the body.
+			</description>
+		</method>
+		<method name="set_joint_limits">
+			<return type="void" />
+			<param index="0" name="joint" type="int" />
+			<param index="1" name="enabled" type="bool" />
+			<param index="2" name="lower" type="float" />
+			<param index="3" name="upper" type="float" />
+			<description>
+				Limits part b's rotation relative to part a at [param joint] to between [param lower] and [param upper], in radians, while [param enabled]. [param lower] must not exceed [param upper], and the range may be anywhere up to a full turn wide: the relative angle is read around the middle of the range. A limit is rigid and wins over the joint's drive.
+			</description>
+		</method>
+		<method name="set_part_transform">
+			<return type="void" />
+			<param index="0" name="part" type="int" />
+			<param index="1" name="position" type="Vector2" />
+			<param index="2" name="rotation" type="float" />
+			<description>
+				Places [param part] at [param position] and [param rotation] outright, keeping its velocities. Use it to pose the body before it starts moving; moving a part this way while it is jointed to others leaves the next [method step] to pull them back together.
+			</description>
+		</method>
+		<method name="set_part_velocity">
+			<return type="void" />
+			<param index="0" name="part" type="int" />
+			<param index="1" name="linear_velocity" type="Vector2" />
+			<param index="2" name="angular_velocity" type="float" />
+			<description>
+				Sets [param part]'s velocities outright.
+			</description>
+		</method>
+		<method name="step">
+			<return type="void" />
+			<param index="0" name="delta" type="float" />
+			<param index="1" name="substeps" type="int" default="4" />
+			<description>
+				Advances the body by [param delta] in [param substeps] equal substeps. Each substep integrates gravity and damping, projects the joint constraints and recovers the velocities from the motion, so more substeps make stiff drives and limits hold better at the same cost per constraint. Both arguments must be positive.
+			</description>
+		</method>
+	</methods>
+</class>
