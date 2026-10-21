@@ -41,6 +41,7 @@
 #include "core/math/expression.h"
 #include "core/object/class_db.h"
 #include "core/object/script_language.h"
+#include "core/object/worker_thread_pool.h"
 #include "core/os/os.h"
 #include "servers/display/display_server.h"
 
@@ -371,6 +372,12 @@ void RemoteDebugger::_poll_messages() {
 		msg.message = cmd[0];
 		msg.data = cmd[2];
 		messages[thread].push_back(msg);
+
+		// While a thread sits in `debug()`, the main thread may be blocked waiting for it in the WorkerThreadPool.
+		// Wake it so messages addressed to it (remote inspection, etc.) still get handled.
+		if (thread == Thread::get_main_id() && !Thread::is_main_thread() && !threads_in_break.is_empty() && WorkerThreadPool::get_singleton()) {
+			WorkerThreadPool::get_singleton()->notify_main_thread_debugger_messages();
+		}
 	}
 }
 

@@ -149,6 +149,13 @@ private:
 	} runlevel_data;
 	ConditionVariable control_cond_var;
 
+	// State for `_wait_for_done_semaphore()`: lets the main thread, while blocked in a wait, be woken to service
+	// debugger messages addressed to it.
+	BinaryMutex main_waiter_mutex;
+	ConditionVariable main_waiter_cond_var;
+	SafeNumeric<uint32_t> main_thread_waits; // Depth of nested main thread waits, so completions know to notify.
+	bool main_debugger_messages_pending = false; // Guarded by `main_waiter_mutex`.
+
 	HashMap<Thread::ID, int> thread_ids;
 	HashMap<
 			TaskID,
@@ -229,6 +236,9 @@ private:
 	void _lock_unlockable_mutexes();
 	void _unlock_unlockable_mutexes();
 
+	void _wait_for_done_semaphore(const Semaphore &p_semaphore, bool p_relock_unlockable_mutexes);
+	void _notify_main_thread_waiter();
+
 protected:
 	static void _bind_methods();
 
@@ -251,6 +261,9 @@ public:
 
 	void yield();
 	void notify_yield_over(TaskID p_task_id);
+
+	// Wakes a main thread blocked in a wait so it can process debugger messages addressed to it.
+	void notify_main_thread_debugger_messages();
 
 	template <typename C, typename M, typename U>
 	GroupID add_template_group_task(C *p_instance, M p_method, U p_userdata, int p_elements, int p_tasks = -1, bool p_high_priority = false, const String &p_description = String()) {
