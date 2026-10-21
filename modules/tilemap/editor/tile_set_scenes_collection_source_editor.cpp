@@ -32,6 +32,7 @@
 
 #include "tile_set_editor.h"
 
+#include "core/input/input_event.h"
 #include "core/io/resource_loader.h"
 #include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
@@ -45,6 +46,7 @@
 #include "scene/gui/button.h"
 #include "scene/gui/item_list.h"
 #include "scene/gui/label.h"
+#include "scene/gui/slider.h"
 #include "scene/gui/split_container.h"
 
 void TileSetScenesCollectionSourceEditor::TileSetScenesCollectionProxyObject::set_id(int p_id) {
@@ -238,6 +240,45 @@ void TileSetScenesCollectionSourceEditor::_scenes_list_item_activated(int p_inde
 	}
 }
 
+void TileSetScenesCollectionSourceEditor::_scenes_list_gui_input(const Ref<InputEvent> &p_event) {
+	// Ctrl + mouse wheel resizes the thumbnails in grid view.
+	const Ref<InputEventMouseButton> mb = p_event;
+	if (mb.is_valid() && mb->is_pressed() && mb->is_command_or_control_pressed() && scene_tiles_grid_view) {
+		if (mb->get_button_index() == MouseButton::WHEEL_UP) {
+			scene_tiles_size_slider->set_value(scene_tiles_thumbnail_size + 16);
+			scene_tiles_list->accept_event();
+		} else if (mb->get_button_index() == MouseButton::WHEEL_DOWN) {
+			scene_tiles_size_slider->set_value(scene_tiles_thumbnail_size - 16);
+			scene_tiles_list->accept_event();
+		}
+	}
+}
+
+void TileSetScenesCollectionSourceEditor::_scenes_list_sort_toggled(bool p_pressed) {
+	scene_tiles_sort_by_name = p_pressed;
+	_save_scenes_list_options();
+	_update_scenes_list();
+}
+
+void TileSetScenesCollectionSourceEditor::_scenes_list_grid_toggled(bool p_pressed) {
+	scene_tiles_grid_view = p_pressed;
+	scene_tiles_size_slider->set_visible(scene_tiles_grid_view);
+	_save_scenes_list_options();
+	_update_scenes_list();
+}
+
+void TileSetScenesCollectionSourceEditor::_scenes_list_thumbnail_size_changed(float p_value) {
+	scene_tiles_thumbnail_size = p_value;
+	_save_scenes_list_options();
+	_update_scenes_list();
+}
+
+void TileSetScenesCollectionSourceEditor::_save_scenes_list_options() {
+	EditorSettings::get_singleton()->set_project_metadata("editor_metadata", "scene_tiles_grid_view", scene_tiles_grid_view);
+	EditorSettings::get_singleton()->set_project_metadata("editor_metadata", "scene_tiles_sort_by_name", scene_tiles_sort_by_name);
+	EditorSettings::get_singleton()->set_project_metadata("editor_metadata", "scene_tiles_thumbnail_size", scene_tiles_thumbnail_size);
+}
+
 void TileSetScenesCollectionSourceEditor::_source_add_pressed() {
 	if (!scene_select_dialog) {
 		scene_select_dialog = memnew(EditorFileDialog);
@@ -329,24 +370,67 @@ void TileSetScenesCollectionSourceEditor::_update_scenes_list() {
 	// Clear the list.
 	scene_tiles_list->clear();
 
+	// Layout: a grid of thumbnails with the name underneath, or one row per tile.
+	const int thumbnail_size = (scene_tiles_grid_view ? scene_tiles_thumbnail_size : int(EDITOR_GET("filesystem/file_dialog/thumbnail_size"))) * EDSCALE;
+	if (scene_tiles_grid_view) {
+		scene_tiles_list->set_icon_mode(ItemList::ICON_MODE_TOP);
+		scene_tiles_list->set_max_columns(0);
+		scene_tiles_list->set_fixed_column_width(thumbnail_size * 3 / 2);
+		scene_tiles_list->set_max_text_lines(2);
+	} else {
+		scene_tiles_list->set_icon_mode(ItemList::ICON_MODE_LEFT);
+		scene_tiles_list->set_max_columns(1);
+		scene_tiles_list->set_fixed_column_width(0);
+		scene_tiles_list->set_max_text_lines(1);
+	}
+	scene_tiles_list->set_fixed_icon_size(Vector2(thumbnail_size, thumbnail_size));
+
+	// Collect the tiles, in ID order or sorted by name.
+	struct SceneTileEntry {
+		int scene_id = -1;
+		Ref<PackedScene> scene;
+		String name;
+	};
+	struct SceneTileNameComparator {
+		bool operator()(const SceneTileEntry &p_a, const SceneTileEntry &p_b) const {
+			const int cmp = p_a.name.naturalnocasecmp_to(p_b.name);
+			return cmp != 0 ? cmp < 0 : p_a.scene_id < p_b.scene_id;
+		}
+	};
+	LocalVector<SceneTileEntry> entries;
+	for (int i = 0; i < tile_set_scenes_collection_source->get_scene_tiles_count(); i++) {
+		SceneTileEntry entry;
+		entry.scene_id = tile_set_scenes_collection_source->get_scene_tile_id(i);
+		entry.scene = tile_set_scenes_collection_source->get_scene_tile_scene(entry.scene_id);
+		if (entry.scene.is_valid()) {
+			entry.name = entry.scene->get_path().get_file().get_basename();
+		}
+		entries.push_back(entry);
+	}
+	if (scene_tiles_sort_by_name) {
+		entries.sort_custom<SceneTileNameComparator>();
+	}
+
 	// Rebuild the list.
 	int to_reselect = -1;
-	for (int i = 0; i < tile_set_scenes_collection_source->get_scene_tiles_count(); i++) {
-		int scene_id = tile_set_scenes_collection_source->get_scene_tile_id(i);
-
-		Ref<PackedScene> scene = tile_set_scenes_collection_source->get_scene_tile_scene(scene_id);
-
+	for (const SceneTileEntry &entry : entries) {
 		int item_index = 0;
-		if (scene.is_valid()) {
-			item_index = scene_tiles_list->add_item(vformat("%s (path:%s id:%d)", scene->get_path().get_file().get_basename(), scene->get_path(), scene_id));
-			EditorResourcePreview::get_singleton()->queue_edited_resource_preview(scene, callable_mp(this, &TileSetScenesCollectionSourceEditor::_scene_thumbnail_done).bind(i));
+		if (entry.scene.is_valid()) {
+			const String details = vformat("%s (path:%s id:%d)", entry.name, entry.scene->get_path(), entry.scene_id);
+			if (scene_tiles_grid_view) {
+				item_index = scene_tiles_list->add_item(entry.name);
+				scene_tiles_list->set_item_tooltip(item_index, details);
+			} else {
+				item_index = scene_tiles_list->add_item(details);
+			}
+			EditorResourcePreview::get_singleton()->queue_edited_resource_preview(entry.scene, callable_mp(this, &TileSetScenesCollectionSourceEditor::_scene_thumbnail_done).bind(item_index));
 		} else {
 			item_index = scene_tiles_list->add_item(TTR("Tile with Invalid Scene"), get_editor_theme_icon(SNAME("PackedScene")));
 		}
-		scene_tiles_list->set_item_metadata(item_index, scene_id);
+		scene_tiles_list->set_item_metadata(item_index, entry.scene_id);
 
-		if (old_selected_scene_id >= 0 && scene_id == old_selected_scene_id) {
-			to_reselect = i;
+		if (old_selected_scene_id >= 0 && entry.scene_id == old_selected_scene_id) {
+			to_reselect = item_index;
 		}
 	}
 	if (scene_tiles_list->get_item_count() == 0) {
@@ -358,10 +442,6 @@ void TileSetScenesCollectionSourceEditor::_update_scenes_list() {
 	if (to_reselect >= 0) {
 		scene_tiles_list->select(to_reselect);
 	}
-
-	// Icon size update.
-	int int_size = int(EDITOR_GET("filesystem/file_dialog/thumbnail_size")) * EDSCALE;
-	scene_tiles_list->set_fixed_icon_size(Vector2(int_size, int_size));
 }
 
 void TileSetScenesCollectionSourceEditor::_notification(int p_what) {
@@ -382,6 +462,8 @@ void TileSetScenesCollectionSourceEditor::_notification(int p_what) {
 		case NOTIFICATION_THEME_CHANGED: {
 			scene_tile_add_button->set_button_icon(get_editor_theme_icon(SNAME("Add")));
 			scene_tile_delete_button->set_button_icon(get_editor_theme_icon(SNAME("Remove")));
+			scene_tiles_sort_button->set_button_icon(get_editor_theme_icon(SNAME("Sort")));
+			scene_tiles_grid_button->set_button_icon(get_editor_theme_icon(SNAME("FileThumbnail")));
 			_update_scenes_list();
 		} break;
 
@@ -571,7 +653,12 @@ TileSetScenesCollectionSourceEditor::TileSetScenesCollectionSourceEditor() {
 	scene_tiles_list->connect(SceneStringName(item_selected), callable_mp(this, &TileSetScenesCollectionSourceEditor::_update_action_buttons).unbind(1));
 	scene_tiles_list->connect("item_activated", callable_mp(this, &TileSetScenesCollectionSourceEditor::_scenes_list_item_activated));
 	scene_tiles_list->set_texture_filter(CanvasItem::TEXTURE_FILTER_NEAREST);
+	scene_tiles_list->connect(SceneStringName(gui_input), callable_mp(this, &TileSetScenesCollectionSourceEditor::_scenes_list_gui_input));
 	right_vbox_container->add_child(scene_tiles_list);
+
+	scene_tiles_grid_view = EditorSettings::get_singleton()->get_project_metadata("editor_metadata", "scene_tiles_grid_view", false);
+	scene_tiles_sort_by_name = EditorSettings::get_singleton()->get_project_metadata("editor_metadata", "scene_tiles_sort_by_name", false);
+	scene_tiles_thumbnail_size = EditorSettings::get_singleton()->get_project_metadata("editor_metadata", "scene_tiles_thumbnail_size", 64);
 
 	HBoxContainer *scenes_bottom_actions = memnew(HBoxContainer);
 	right_vbox_container->add_child(scenes_bottom_actions);
@@ -588,6 +675,43 @@ TileSetScenesCollectionSourceEditor::TileSetScenesCollectionSourceEditor() {
 	scene_tile_delete_button->connect(SceneStringName(pressed), callable_mp(this, &TileSetScenesCollectionSourceEditor::_source_delete_pressed));
 	scene_tile_delete_button->set_accessibility_name(TTRC("Delete"));
 	scenes_bottom_actions->add_child(scene_tile_delete_button);
+
+	Control *scenes_bottom_spacer = memnew(Control);
+	scenes_bottom_spacer->set_h_size_flags(SIZE_EXPAND_FILL);
+	scenes_bottom_actions->add_child(scenes_bottom_spacer);
+
+	scene_tiles_size_slider = memnew(HSlider);
+	scene_tiles_size_slider->set_min(32);
+	scene_tiles_size_slider->set_max(224);
+	scene_tiles_size_slider->set_step(16);
+	scene_tiles_size_slider->set_value_no_signal(scene_tiles_thumbnail_size);
+	scene_tiles_size_slider->set_custom_minimum_size(Size2(64 * EDSCALE, 0));
+	scene_tiles_size_slider->set_custom_maximum_size(Size2(128 * EDSCALE, -1));
+	scene_tiles_size_slider->set_v_size_flags(SIZE_SHRINK_CENTER);
+	scene_tiles_size_slider->set_h_size_flags(SIZE_EXPAND_FILL);
+	scene_tiles_size_slider->set_visible(scene_tiles_grid_view);
+	scene_tiles_size_slider->set_tooltip_text(TTRC("Thumbnail size. Ctrl + mouse wheel over the list also changes it."));
+	scene_tiles_size_slider->set_accessibility_name(TTRC("Thumbnail Size"));
+	scene_tiles_size_slider->connect(SceneStringName(value_changed), callable_mp(this, &TileSetScenesCollectionSourceEditor::_scenes_list_thumbnail_size_changed));
+	scenes_bottom_actions->add_child(scene_tiles_size_slider);
+
+	scene_tiles_sort_button = memnew(Button);
+	scene_tiles_sort_button->set_theme_type_variation(SceneStringName(FlatButton));
+	scene_tiles_sort_button->set_toggle_mode(true);
+	scene_tiles_sort_button->set_pressed_no_signal(scene_tiles_sort_by_name);
+	scene_tiles_sort_button->set_tooltip_text(TTRC("Sort scene tiles by name instead of by ID."));
+	scene_tiles_sort_button->set_accessibility_name(TTRC("Sort by Name"));
+	scene_tiles_sort_button->connect(SceneStringName(toggled), callable_mp(this, &TileSetScenesCollectionSourceEditor::_scenes_list_sort_toggled));
+	scenes_bottom_actions->add_child(scene_tiles_sort_button);
+
+	scene_tiles_grid_button = memnew(Button);
+	scene_tiles_grid_button->set_theme_type_variation(SceneStringName(FlatButton));
+	scene_tiles_grid_button->set_toggle_mode(true);
+	scene_tiles_grid_button->set_pressed_no_signal(scene_tiles_grid_view);
+	scene_tiles_grid_button->set_tooltip_text(TTRC("View scene tiles as a grid of thumbnails."));
+	scene_tiles_grid_button->set_accessibility_name(TTRC("Grid View"));
+	scene_tiles_grid_button->connect(SceneStringName(toggled), callable_mp(this, &TileSetScenesCollectionSourceEditor::_scenes_list_grid_toggled));
+	scenes_bottom_actions->add_child(scene_tiles_grid_button);
 
 	EditorInspector::add_inspector_plugin(memnew(TileSourceInspectorPlugin));
 }
