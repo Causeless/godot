@@ -70,6 +70,7 @@ class ArticulatedBody2D : public RefCounted {
 		real_t limit_upper = 0.0;
 		real_t drive_target = 0.0; // Relative angle the drive pulls toward.
 		real_t drive_compliance = -1.0; // Negative while the drive is off, zero for a rigid drive.
+		real_t damping = 0.0; // Fraction of the relative angular velocity taken out per unit of time.
 	};
 
 	struct Contact {
@@ -118,6 +119,7 @@ public:
 	void set_joint_pin_compliance(int p_joint, real_t p_compliance);
 	void set_joint_limits(int p_joint, bool p_enabled, real_t p_lower, real_t p_upper);
 	void set_joint_drive(int p_joint, real_t p_target_angle, real_t p_compliance);
+	void set_joint_damping(int p_joint, real_t p_damping);
 
 	void clear_contacts();
 	int add_contact(int p_part, const Vector2 &p_local_point, const Vector2 &p_plane_point, const Vector2 &p_plane_normal, real_t p_friction);

@@ -187,6 +187,11 @@ int ArticulatedBody2D::get_contact_count() const {
 	return contacts.size();
 }
 
+void ArticulatedBody2D::set_joint_damping(int p_joint, real_t p_damping) {
+	ERR_FAIL_UNSIGNED_INDEX((uint32_t)p_joint, joints.size());
+	joints[p_joint].damping = MAX(p_damping, (real_t)0.0);
+}
+
 void ArticulatedBody2D::set_gravity(const Vector2 &p_gravity) {
 	gravity = p_gravity;
 }
@@ -389,6 +394,24 @@ void ArticulatedBody2D::step(real_t p_delta, int p_substeps) {
 			}
 		}
 
+		// Joint damping: takes a share of each joint's relative angular velocity out of both parts, by their inertias,
+		// which is what keeps a driven limb from swinging about its target like an undamped spring.
+		for (const Joint &joint : joints) {
+			if (joint.damping <= 0.0) {
+				continue;
+			}
+			Part &a = parts[joint.part_a];
+			Part &b = parts[joint.part_b];
+			const real_t w_sum = a.inverse_inertia + b.inverse_inertia;
+			if (w_sum <= 0.0) {
+				continue;
+			}
+			const real_t share = MIN(joint.damping * h, (real_t)1.0);
+			const real_t impulse = (b.angular_velocity - a.angular_velocity) * share / w_sum;
+			a.angular_velocity += impulse * a.inverse_inertia;
+			b.angular_velocity -= impulse * b.inverse_inertia;
+		}
+
 		// Contact velocities: a touching point keeps no velocity into or out of its plane, so being pushed out of it
 		// doesn't read as a bounce, and dynamic friction takes as much of its slide as the normal push allows.
 		for (const Contact &contact : contacts) {
@@ -447,6 +470,7 @@ void ArticulatedBody2D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_joint_pin_compliance", "joint", "compliance"), &ArticulatedBody2D::set_joint_pin_compliance);
 	ClassDB::bind_method(D_METHOD("set_joint_limits", "joint", "enabled", "lower", "upper"), &ArticulatedBody2D::set_joint_limits);
 	ClassDB::bind_method(D_METHOD("set_joint_drive", "joint", "target_angle", "compliance"), &ArticulatedBody2D::set_joint_drive);
+	ClassDB::bind_method(D_METHOD("set_joint_damping", "joint", "damping"), &ArticulatedBody2D::set_joint_damping);
 
 	ClassDB::bind_method(D_METHOD("clear_contacts"), &ArticulatedBody2D::clear_contacts);
 	ClassDB::bind_method(D_METHOD("add_contact", "part", "local_point", "plane_point", "plane_normal", "friction"), &ArticulatedBody2D::add_contact);

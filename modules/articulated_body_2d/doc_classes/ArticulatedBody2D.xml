@@ -164,6 +164,14 @@
 				Sets the acceleration applied to every movable part each step.
 			</description>
 		</method>
+		<method name="set_joint_damping">
+			<return type="void" />
+			<param index="0" name="joint" type="int" />
+			<param index="1" name="damping" type="float" />
+			<description>
+				Takes the given fraction of [param joint]'s relative angular velocity out per unit of time, shared between its two parts by their inertias. Zero, the default, leaves the joint undamped; a driven joint then swings about its target like an undamped spring, so give drives some. Negative values count as zero.
+			</description>
+		</method>
 		<method name="set_joint_drive">
 			<return type="void" />
 			<param index="0" name="joint" type="int" />
