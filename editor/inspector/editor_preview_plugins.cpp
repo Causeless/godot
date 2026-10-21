@@ -33,11 +33,23 @@
 #include "core/config/project_settings.h"
 #include "core/io/image.h"
 #include "core/io/resource_loader.h"
+#include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
+#include "core/object/message_queue.h"
 #include "core/object/script_language.h"
+#include "core/os/os.h"
+#include "editor/editor_node.h"
 #include "editor/file_system/editor_paths.h"
 #include "editor/settings/editor_settings.h"
 #include "editor/themes/editor_scale.h"
+#include "main/main.h"
+#include "scene/2d/audio_stream_player_2d.h"
+#include "scene/2d/camera_2d.h"
+#include "scene/audio/audio_stream_player.h"
+#include "scene/gui/video_stream_player.h"
+#include "scene/main/scene_tree.h"
+#include "scene/main/viewport.h"
+#include "scene/main/window.h"
 #include "scene/resources/atlas_texture.h"
 #include "scene/resources/audio/audio_stream.h"
 #include "scene/resources/bit_map.h"
@@ -46,6 +58,7 @@
 #include "scene/resources/image_texture.h"
 #include "scene/resources/material.h"
 #include "scene/resources/mesh.h"
+#include "scene/resources/packed_scene.h"
 #include "servers/audio/audio_server.h"
 #include "servers/rendering/rendering_server.h"
 
@@ -293,16 +306,44 @@ bool EditorPackedScenePreviewPlugin::handles(const String &p_type) const {
 	return ClassDB::is_parent_class(p_type, "PackedScene");
 }
 
+void EditorPackedScenePreviewPlugin::abort() {
+	aborted.set();
+	if (EditorResourcePreview::get_singleton()->is_threaded()) {
+		semaphore.post();
+	}
+}
+
 Ref<Texture2D> EditorPackedScenePreviewPlugin::generate(const Ref<Resource> &p_from, const Size2 &p_size, Dictionary &p_metadata) const {
-	return generate_from_path(p_from->get_path(), p_size, p_metadata);
+	Ref<PackedScene> scene = p_from;
+	ERR_FAIL_COND_V(scene.is_null(), Ref<Texture2D>());
+	return _generate_from_scene(scene, scene->get_path(), p_size);
 }
 
 Ref<Texture2D> EditorPackedScenePreviewPlugin::generate_from_path(const String &p_path, const Size2 &p_size, Dictionary &p_metadata) const {
+	// Instantiating a very large scene just for a thumbnail would stall the editor.
+	{
+		Ref<FileAccess> f = FileAccess::open(p_path, FileAccess::READ);
+		if (f.is_null()) {
+			return Ref<Texture2D>();
+		}
+		const uint64_t max_size = uint64_t(MAX(0, int(EDITOR_GET("docks/filesystem/scene_thumbnail_max_file_size_kb")))) * 1024;
+		if (f->get_length() > max_size) {
+			return _load_saved_thumbnail(p_path);
+		}
+	}
+
+	Ref<PackedScene> scene = ResourceLoader::load(p_path, "PackedScene");
+	if (scene.is_null()) {
+		return _load_saved_thumbnail(p_path);
+	}
+	return _generate_from_scene(scene, p_path, p_size);
+}
+
+// Thumbnail captured from the editor viewport when the scene was saved.
+Ref<Texture2D> EditorPackedScenePreviewPlugin::_load_saved_thumbnail(const String &p_path) const {
 	String temp_path = EditorPaths::get_singleton()->get_cache_dir();
 	String cache_base = ProjectSettings::get_singleton()->globalize_path(p_path).md5_text();
 	cache_base = temp_path.path_join("resthumb-" + cache_base);
-
-	//does not have it, try to load a cached thumbnail
 
 	String path = cache_base + ".png";
 
@@ -319,6 +360,453 @@ Ref<Texture2D> EditorPackedScenePreviewPlugin::generate_from_path(const String &
 
 	} else {
 		return Ref<Texture2D>();
+	}
+}
+
+Ref<Texture2D> EditorPackedScenePreviewPlugin::_generate_from_scene(const Ref<PackedScene> &p_scene, const String &p_path, const Size2 &p_size) const {
+	int count_2d = 0;
+	int count_3d = 0;
+	_count_node_types(p_scene->get_state(), count_2d, count_3d, 0);
+
+	if (count_2d == 0 || count_3d >= count_2d) {
+		// Nothing to draw in 2D, or a 3D scene: use the thumbnail captured when the scene was saved, if any.
+		return _load_saved_thumbnail(p_path);
+	}
+
+	HashMap<const PackedScene *, Ref<PackedScene>> memo;
+	Ref<PackedScene> stripped = _strip_scripts(p_scene, memo, 0);
+	if (stripped.is_null()) {
+		return _load_saved_thumbnail(p_path);
+	}
+
+	Ref<Image> img = _render_scene(stripped, Size2i(p_size));
+	if (img.is_null()) {
+		return _load_saved_thumbnail(p_path);
+	}
+
+	post_process_preview(img);
+	return ImageTexture::create_from_image(img);
+}
+
+// Counts CanvasItem and Node3D nodes from the scene state, without instantiating anything.
+void EditorPackedScenePreviewPlugin::_count_node_types(const Ref<SceneState> &p_state, int &r_count_2d, int &r_count_3d, int p_depth) {
+	if (p_state.is_null() || p_depth > MAX_SCENE_DEPTH) {
+		return;
+	}
+
+	for (int i = 0; i < p_state->get_node_count(); i++) {
+		const StringName type = p_state->get_node_type(i);
+		if (type == StringName()) {
+			// Instanced scene, or the root of an inherited scene (which yields the base scene).
+			Ref<PackedScene> instance = p_state->get_node_instance(i);
+			if (instance.is_valid()) {
+				_count_node_types(instance->get_state(), r_count_2d, r_count_3d, p_depth + 1);
+			}
+		} else if (ClassDB::is_parent_class(type, "CanvasItem")) {
+			r_count_2d++;
+		} else if (ClassDB::is_parent_class(type, "Node3D")) {
+			r_count_3d++;
+		}
+	}
+}
+
+// Returns a copy of the scene whose nodes (including instanced and inherited scenes) carry no scripts,
+// so that instantiating it for the preview never runs tool scripts.
+Ref<PackedScene> EditorPackedScenePreviewPlugin::_strip_scripts(const Ref<PackedScene> &p_scene, HashMap<const PackedScene *, Ref<PackedScene>> &r_memo, int p_depth) {
+	if (p_scene.is_null()) {
+		return Ref<PackedScene>();
+	}
+	if (p_depth > MAX_SCENE_DEPTH) {
+		return p_scene;
+	}
+	{
+		const Ref<PackedScene> *memo = r_memo.getptr(p_scene.ptr());
+		if (memo) {
+			return *memo;
+		}
+	}
+
+	Dictionary bundled = p_scene->get_state()->get_bundled_scene();
+	Array variants = bundled["variants"];
+	variants = variants.duplicate();
+	for (int i = 0; i < variants.size(); i++) {
+		const Variant &v = variants[i];
+		if (v.get_type() != Variant::OBJECT) {
+			continue;
+		}
+		Ref<Script> script = v;
+		if (script.is_valid()) {
+			variants[i] = Variant();
+			continue;
+		}
+		Ref<PackedScene> sub_scene = v;
+		if (sub_scene.is_valid()) {
+			variants[i] = _strip_scripts(sub_scene, r_memo, p_depth + 1);
+		}
+	}
+	bundled["variants"] = variants;
+
+	// Signal connections only make sense with the scripts they call.
+	bundled["conn_count"] = 0;
+	bundled["conns"] = Vector<int>();
+
+	// Properties holding node references are resolved after instantiation by reading them back from
+	// the node; without scripts they do not exist, so drop them. Same layout as SceneState::set_bundled_scene.
+	{
+		const int node_count = bundled["node_count"];
+		const Vector<int> nodes = bundled["nodes"];
+		Vector<int> filtered;
+		int idx = 0;
+		bool valid = true;
+		auto read = [&]() {
+			if (idx >= nodes.size()) {
+				valid = false;
+				return 0;
+			}
+			return nodes[idx++];
+		};
+		for (int i = 0; i < node_count && valid; i++) {
+			for (int k = 0; k < 5; k++) { // parent, owner, type, name, instance
+				filtered.push_back(read());
+			}
+			const int prop_count = read();
+			const int count_pos = filtered.size();
+			filtered.push_back(0);
+			int kept = 0;
+			for (int j = 0; j < prop_count; j++) {
+				const int name = read();
+				const int value = read();
+				if (name & SceneState::FLAG_PATH_PROPERTY_IS_NODE) {
+					continue;
+				}
+				filtered.push_back(name);
+				filtered.push_back(value);
+				kept++;
+			}
+			filtered.write[count_pos] = kept;
+			const int group_count = read();
+			filtered.push_back(group_count);
+			for (int j = 0; j < group_count; j++) {
+				filtered.push_back(read());
+			}
+		}
+		if (valid) {
+			bundled["nodes"] = filtered;
+		}
+	}
+
+	Ref<PackedScene> stripped;
+	stripped.instantiate();
+	stripped->get_state()->set_bundled_scene(bundled);
+	stripped->set_path_cache(p_scene->get_path());
+
+	r_memo.insert(p_scene.ptr(), stripped);
+	return stripped;
+}
+
+// Nodes that only draw helpers in the editor (collision shapes, paths, markers...). They are kept out
+// of the thumbnail and out of the framing.
+bool EditorPackedScenePreviewPlugin::_is_editor_only_visual(const CanvasItem *p_item) {
+	static const char *editor_only_classes[] = {
+		"CollisionShape2D",
+		"CollisionPolygon2D",
+		"RayCast2D",
+		"ShapeCast2D",
+		"LightOccluder2D",
+		"Marker2D",
+		"Path2D",
+		"Bone2D",
+		"Joint2D",
+		"NavigationRegion2D",
+		"NavigationLink2D",
+		"NavigationObstacle2D",
+		"VisibleOnScreenNotifier2D",
+		"BackBufferCopy",
+		"TouchScreenButton",
+		nullptr,
+	};
+	const StringName class_name = p_item->get_class_name();
+	for (int i = 0; editor_only_classes[i]; i++) {
+		if (ClassDB::is_parent_class(class_name, editor_only_classes[i])) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Local-space rect of what a CanvasItem draws. Empty when unknown.
+Rect2 EditorPackedScenePreviewPlugin::_get_item_rect(CanvasItem *p_item) {
+	if (p_item->is_class("TileMapLayer")) {
+		// Accessed through calls so the editor does not depend on the tilemap module.
+		const Rect2i used_rect = p_item->call("get_used_rect");
+		if (used_rect.size.x <= 0 || used_rect.size.y <= 0) {
+			return Rect2();
+		}
+		Vector2 tile_size = Vector2(16, 16);
+		Ref<Resource> tile_set = p_item->call("get_tile_set");
+		if (tile_set.is_valid()) {
+			tile_size = Vector2(Vector2i(tile_set->call("get_tile_size")));
+		}
+		const Vector2 first = p_item->call("map_to_local", used_rect.position);
+		const Vector2 last = p_item->call("map_to_local", used_rect.get_end() - Vector2i(1, 1));
+		Rect2 rect(first, Size2());
+		rect.expand_to(last);
+		return rect.grow(MAX(tile_size.x, tile_size.y));
+	}
+
+#ifdef DEBUG_ENABLED
+	return p_item->_edit_get_rect();
+#else
+	return Rect2();
+#endif
+}
+
+// Disables everything in the instance that would move the view, make noise, or draw editor helpers.
+void EditorPackedScenePreviewPlugin::_prepare_instance(Node *p_node) {
+	if (Camera2D *camera = Object::cast_to<Camera2D>(p_node)) {
+		camera->set_enabled(false);
+	} else if (AudioStreamPlayer *player = Object::cast_to<AudioStreamPlayer>(p_node)) {
+		player->set_autoplay(false);
+	} else if (AudioStreamPlayer2D *player_2d = Object::cast_to<AudioStreamPlayer2D>(p_node)) {
+		player_2d->set_autoplay(false);
+	} else if (VideoStreamPlayer *video = Object::cast_to<VideoStreamPlayer>(p_node)) {
+		video->set_autoplay(false);
+	} else if (CanvasItem *ci = Object::cast_to<CanvasItem>(p_node)) {
+		if (_is_editor_only_visual(ci)) {
+			ci->set_self_modulate(Color(1, 1, 1, 0));
+		}
+	}
+
+	for (int i = 0; i < p_node->get_child_count(); i++) {
+		_prepare_instance(p_node->get_child(i));
+	}
+}
+
+// Bounding rect, in the viewport's canvas space, of everything the scene draws.
+void EditorPackedScenePreviewPlugin::_expand_rect(Rect2 &r_rect, bool &r_first, Node *p_node) {
+	if (Object::cast_to<Viewport>(p_node)) {
+		return;
+	}
+
+	CanvasItem *ci = Object::cast_to<CanvasItem>(p_node);
+	if (ci) {
+		if (!ci->is_visible_in_tree()) {
+			return;
+		}
+		if (!_is_editor_only_visual(ci)) {
+			const Rect2 local_rect = _get_item_rect(ci);
+			if (local_rect.size.x > 0 && local_rect.size.y > 0) {
+				const Rect2 rect = ci->get_global_transform_with_canvas().xform(local_rect);
+				if (r_first) {
+					r_rect = rect;
+					r_first = false;
+				} else {
+					r_rect = r_rect.merge(rect);
+				}
+			}
+		}
+	}
+
+	for (int i = 0; i < p_node->get_child_count(); i++) {
+		_expand_rect(r_rect, r_first, p_node->get_child(i));
+	}
+}
+
+Ref<Image> EditorPackedScenePreviewPlugin::_render_scene(const Ref<PackedScene> &p_scene, const Size2i &p_size) const {
+	if (aborted.is_set()) {
+		return Ref<Image>();
+	}
+
+	pending_scene = p_scene;
+	result_image.unref();
+	result_size = p_size.maxi(1);
+
+	if (EditorResourcePreview::get_singleton()->is_threaded()) {
+		callable_mp(const_cast<EditorPackedScenePreviewPlugin *>(this), &EditorPackedScenePreviewPlugin::_main_thread_setup).call_deferred();
+		semaphore.wait();
+	} else {
+		_main_thread_setup();
+	}
+
+	Ref<Image> img = result_image;
+	result_image.unref();
+	pending_scene.unref();
+	return img;
+}
+
+SubViewport *EditorPackedScenePreviewPlugin::_get_viewport() const {
+	SubViewport *vp = Object::cast_to<SubViewport>(ObjectDB::get_instance(viewport_id));
+	if (vp) {
+		return vp;
+	}
+	EditorNode *editor = EditorNode::get_singleton();
+	if (!editor || !editor->is_inside_tree()) {
+		return nullptr;
+	}
+
+	vp = memnew(SubViewport);
+	vp->set_name("ScenePreviewViewport");
+	vp->set_update_mode(SubViewport::UPDATE_DISABLED);
+	vp->set_size(result_size * SUPERSAMPLE);
+	vp->set_disable_3d(true);
+	vp->set_disable_input(true);
+	vp->set_transparent_background(true);
+
+	// Match how the edited scene is displayed.
+	SubViewport *scene_root = editor->get_scene_root();
+	if (scene_root) {
+		vp->set_default_canvas_item_texture_filter(scene_root->get_default_canvas_item_texture_filter());
+		vp->set_default_canvas_item_texture_repeat(scene_root->get_default_canvas_item_texture_repeat());
+		vp->set_snap_2d_transforms_to_pixel(scene_root->is_snap_2d_transforms_to_pixel_enabled());
+		vp->set_snap_2d_vertices_to_pixel(scene_root->is_snap_2d_vertices_to_pixel_enabled());
+		vp->set_use_hdr_2d(scene_root->is_using_hdr_2d());
+	}
+
+	editor->add_child(vp);
+	viewport_id = vp->get_instance_id();
+	return vp;
+}
+
+// Main thread. Instantiates the scene into the offscreen viewport.
+void EditorPackedScenePreviewPlugin::_main_thread_setup() const {
+	if (aborted.is_set() || pending_scene.is_null()) {
+		_finish(Ref<Image>());
+		return;
+	}
+
+	SubViewport *vp = _get_viewport();
+	if (!vp) {
+		_finish(Ref<Image>());
+		return;
+	}
+
+	vp->set_size(result_size * SUPERSAMPLE);
+	vp->set_global_canvas_transform(Transform2D());
+
+	Node *instance = pending_scene->instantiate(PackedScene::GEN_EDIT_STATE_DISABLED);
+	if (!instance) {
+		_finish(Ref<Image>());
+		return;
+	}
+
+	_prepare_instance(instance);
+	instance->set_process_mode(Node::PROCESS_MODE_DISABLED);
+	scene_instance = instance;
+	vp->add_child(instance);
+
+	if (EditorResourcePreview::get_singleton()->is_threaded()) {
+		// Let the nodes settle for a full frame (deferred layout and redraw requests), then draw.
+		RS::get_singleton()->request_frame_drawn_callback(callable_mp(const_cast<EditorPackedScenePreviewPlugin *>(this), &EditorPackedScenePreviewPlugin::_frame_settled));
+		Main::force_redraw();
+	} else {
+		// Running inside an idle callback on the main thread: flush what the nodes deferred and draw right away.
+		MessageQueue::get_singleton()->flush();
+		if (!_apply_framing()) {
+			_finish(Ref<Image>());
+			return;
+		}
+
+		// Avoid the main viewport and children being redrawn.
+		SceneTree *st = Object::cast_to<SceneTree>(OS::get_singleton()->get_main_loop());
+		ERR_FAIL_NULL_MSG(st, "Editor's MainLoop is not a SceneTree. This is a bug.");
+		RID root_vp = st->get_root()->get_viewport_rid();
+		RS::get_singleton()->viewport_set_active(root_vp, false);
+		RS::get_singleton()->draw(false);
+		RS::get_singleton()->viewport_set_active(root_vp, true);
+
+		_frame_drawn();
+	}
+}
+
+// Main thread, after the frame in which the scene was added was drawn.
+void EditorPackedScenePreviewPlugin::_frame_settled() const {
+	if (aborted.is_set() || !scene_instance) {
+		_finish(Ref<Image>());
+		return;
+	}
+	RS::get_singleton()->connect(SNAME("frame_pre_draw"), callable_mp(const_cast<EditorPackedScenePreviewPlugin *>(this), &EditorPackedScenePreviewPlugin::_pre_draw), Object::CONNECT_ONE_SHOT);
+	Main::force_redraw();
+}
+
+// Main thread, right before the next frame is drawn.
+void EditorPackedScenePreviewPlugin::_pre_draw() const {
+	if (aborted.is_set() || !scene_instance || !_apply_framing()) {
+		_finish(Ref<Image>());
+		return;
+	}
+	RS::get_singleton()->request_frame_drawn_callback(callable_mp(const_cast<EditorPackedScenePreviewPlugin *>(this), &EditorPackedScenePreviewPlugin::_frame_drawn));
+}
+
+// Main thread. Fits the scene's content into the viewport and requests one draw.
+bool EditorPackedScenePreviewPlugin::_apply_framing() const {
+	SubViewport *vp = Object::cast_to<SubViewport>(ObjectDB::get_instance(viewport_id));
+	if (!vp || !scene_instance) {
+		return false;
+	}
+
+	Rect2 rect;
+	bool first = true;
+	_expand_rect(rect, first, scene_instance);
+	if (first) {
+		return false; // Nothing visible.
+	}
+
+	// Some breathing room around the content.
+	rect = rect.grow(MAX(rect.size.x, rect.size.y) * 0.05);
+
+	const Size2 vp_size = Size2(vp->get_size());
+	real_t zoom = MIN(vp_size.x / rect.size.x, vp_size.y / rect.size.y);
+	if (zoom >= 2.0) {
+		// Keep pixel art crisp when magnifying.
+		zoom = Math::floor(zoom);
+	}
+
+	Transform2D xform;
+	xform.scale_basis(Size2(zoom, zoom));
+	xform.columns[2] = vp_size * 0.5 - rect.get_center() * zoom;
+	vp->set_global_canvas_transform(xform);
+
+	vp->set_update_mode(SubViewport::UPDATE_DISABLED);
+	vp->set_update_mode(SubViewport::UPDATE_ONCE);
+	return true;
+}
+
+// Main thread, after the viewport was drawn.
+void EditorPackedScenePreviewPlugin::_frame_drawn() const {
+	Ref<Image> img;
+	SubViewport *vp = Object::cast_to<SubViewport>(ObjectDB::get_instance(viewport_id));
+	if (vp && !aborted.is_set()) {
+		img = vp->get_texture()->get_image();
+		if (img.is_valid() && img->get_width() > 0 && img->get_height() > 0) {
+			img->convert(Image::FORMAT_RGBA8);
+			if (img->get_width() != result_size.x || img->get_height() != result_size.y) {
+				img->resize(result_size.x, result_size.y, Image::INTERPOLATE_LANCZOS);
+			}
+		} else {
+			img.unref();
+		}
+	}
+	_finish(img);
+}
+
+// Main thread. Frees the instance and hands the result back to the generator thread.
+void EditorPackedScenePreviewPlugin::_finish(const Ref<Image> &p_image) const {
+	if (scene_instance) {
+		Node *parent = scene_instance->get_parent();
+		if (parent) {
+			parent->remove_child(scene_instance);
+		}
+		memdelete(scene_instance);
+		scene_instance = nullptr;
+	}
+	SubViewport *vp = Object::cast_to<SubViewport>(ObjectDB::get_instance(viewport_id));
+	if (vp) {
+		vp->set_update_mode(SubViewport::UPDATE_DISABLED);
+	}
+
+	result_image = p_image;
+	if (EditorResourcePreview::get_singleton()->is_threaded()) {
+		semaphore.post();
 	}
 }
 

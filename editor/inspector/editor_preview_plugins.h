@@ -64,13 +64,62 @@ public:
 	virtual Ref<Texture2D> generate(const Ref<Resource> &p_from, const Size2 &p_size, Dictionary &p_metadata) const override;
 };
 
+class PackedScene;
+class SceneState;
+class CanvasItem;
+class SubViewport;
+
+// Thumbnails for scenes.
+//
+// 2D scenes are instantiated with their scripts stripped, added to an offscreen
+// SubViewport, framed so that every visible CanvasItem fits, and drawn once.
+// That has to happen on the main thread, so when the preview generator runs on
+// its own thread the work is posted there and the generator thread waits for
+// the result.
+//
+// 3D scenes keep using the thumbnail captured from the editor viewport when the
+// scene is saved (see EditorNode::_save_scene_with_preview).
 class EditorPackedScenePreviewPlugin : public EditorResourcePreviewGenerator {
 	GDCLASS(EditorPackedScenePreviewPlugin, EditorResourcePreviewGenerator);
+
+	static constexpr int MAX_SCENE_DEPTH = 16;
+	static constexpr int SUPERSAMPLE = 2;
+
+	// State shared between the generator thread and the main thread. Only one
+	// preview is generated at a time, and the semaphore orders every access.
+	mutable Semaphore semaphore;
+	mutable SafeFlag aborted;
+	mutable Ref<PackedScene> pending_scene;
+	mutable Ref<Image> result_image;
+	mutable Size2i result_size;
+	mutable ObjectID viewport_id;
+	mutable Node *scene_instance = nullptr;
+
+	static void _count_node_types(const Ref<SceneState> &p_state, int &r_count_2d, int &r_count_3d, int p_depth);
+	static Ref<PackedScene> _strip_scripts(const Ref<PackedScene> &p_scene, HashMap<const PackedScene *, Ref<PackedScene>> &r_memo, int p_depth);
+	static bool _is_editor_only_visual(const CanvasItem *p_item);
+	static Rect2 _get_item_rect(CanvasItem *p_item);
+	static void _prepare_instance(Node *p_node);
+	static void _expand_rect(Rect2 &r_rect, bool &r_first, Node *p_node);
+
+	Ref<Texture2D> _load_saved_thumbnail(const String &p_path) const;
+	Ref<Texture2D> _generate_from_scene(const Ref<PackedScene> &p_scene, const String &p_path, const Size2 &p_size) const;
+	Ref<Image> _render_scene(const Ref<PackedScene> &p_scene, const Size2i &p_size) const;
+
+	// Main thread only.
+	SubViewport *_get_viewport() const;
+	void _main_thread_setup() const;
+	void _frame_settled() const;
+	void _pre_draw() const;
+	void _frame_drawn() const;
+	bool _apply_framing() const;
+	void _finish(const Ref<Image> &p_image) const;
 
 public:
 	virtual bool handles(const String &p_type) const override;
 	virtual Ref<Texture2D> generate(const Ref<Resource> &p_from, const Size2 &p_size, Dictionary &p_metadata) const override;
 	virtual Ref<Texture2D> generate_from_path(const String &p_path, const Size2 &p_size, Dictionary &p_metadata) const override;
+	virtual void abort() override;
 };
 
 class EditorMaterialPreviewPlugin : public EditorResourcePreviewGenerator {
