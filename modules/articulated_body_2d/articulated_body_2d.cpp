@@ -72,6 +72,16 @@ void ArticulatedBody2D::set_part_velocity(int p_part, const Vector2 &p_linear_ve
 	parts[p_part].angular_velocity = p_angular_velocity;
 }
 
+void ArticulatedBody2D::set_part_radius(int p_part, real_t p_radius) {
+	ERR_FAIL_UNSIGNED_INDEX((uint32_t)p_part, parts.size());
+	parts[p_part].radius = MAX(p_radius, (real_t)0.0);
+}
+
+real_t ArticulatedBody2D::get_part_radius(int p_part) const {
+	ERR_FAIL_UNSIGNED_INDEX_V((uint32_t)p_part, parts.size(), 0.0);
+	return parts[p_part].radius;
+}
+
 Vector2 ArticulatedBody2D::get_part_position(int p_part) const {
 	ERR_FAIL_UNSIGNED_INDEX_V((uint32_t)p_part, parts.size(), Vector2());
 	return parts[p_part].position;
@@ -136,6 +146,11 @@ int ArticulatedBody2D::get_joint_count() const {
 	return joints.size();
 }
 
+void ArticulatedBody2D::set_joint_pin_compliance(int p_joint, real_t p_compliance) {
+	ERR_FAIL_UNSIGNED_INDEX((uint32_t)p_joint, joints.size());
+	joints[p_joint].pin_compliance = MAX(p_compliance, (real_t)0.0);
+}
+
 void ArticulatedBody2D::set_joint_limits(int p_joint, bool p_enabled, real_t p_lower, real_t p_upper) {
 	ERR_FAIL_UNSIGNED_INDEX((uint32_t)p_joint, joints.size());
 	ERR_FAIL_COND_MSG(p_lower > p_upper, "The lower limit must not exceed the upper one.");
@@ -185,6 +200,85 @@ void ArticulatedBody2D::set_damping(real_t p_linear, real_t p_angular) {
 	angular_damping = MAX(p_angular, (real_t)0.0);
 }
 
+// Closes the gap between a joint's two anchors along the line between them, or as much of it as the compliance term
+// (the pin compliance over the substep length squared) leaves. Each part moves and turns by its share of the
+// correction, weighted by how much its anchor can move per unit of impulse.
+void ArticulatedBody2D::_project_pin(const Joint &p_joint, real_t p_compliance_term) {
+	Part &a = parts[p_joint.part_a];
+	Part &b = parts[p_joint.part_b];
+	const Vector2 r_a = p_joint.anchor_a.rotated(a.rotation);
+	const Vector2 r_b = p_joint.anchor_b.rotated(b.rotation);
+	const Vector2 gap = (a.position + r_a) - (b.position + r_b);
+	const real_t gap_length = gap.length();
+	if (gap_length <= (real_t)CMP_EPSILON) {
+		return;
+	}
+	const Vector2 normal = gap / gap_length;
+	const real_t lever_a = r_a.cross(normal);
+	const real_t lever_b = r_b.cross(normal);
+	const real_t w_sum = a.inverse_mass + a.inverse_inertia * lever_a * lever_a + b.inverse_mass + b.inverse_inertia * lever_b * lever_b;
+	if (w_sum <= 0.0) {
+		return;
+	}
+	const Vector2 correction = normal * (-gap_length / (w_sum + p_compliance_term));
+	a.position += correction * a.inverse_mass;
+	a.rotation += a.inverse_inertia * r_a.cross(correction);
+	b.position -= correction * b.inverse_mass;
+	b.rotation -= b.inverse_inertia * r_b.cross(correction);
+}
+
+// Pushes a joint's relative angle back inside its range, rigidly. The angle is read around the middle of the range,
+// so a range anywhere up to a full turn reads right.
+void ArticulatedBody2D::_project_limit(const Joint &p_joint) {
+	if (!p_joint.limit_enabled) {
+		return;
+	}
+	Part &a = parts[p_joint.part_a];
+	Part &b = parts[p_joint.part_b];
+	const real_t w_sum_angular = a.inverse_inertia + b.inverse_inertia;
+	if (w_sum_angular <= 0.0) {
+		return;
+	}
+	const real_t middle = (p_joint.limit_lower + p_joint.limit_upper) * (real_t)0.5;
+	const real_t relative = middle + Math::wrapf(b.rotation - a.rotation - middle, (real_t)-Math::PI, (real_t)Math::PI);
+	real_t error = 0.0;
+	if (relative > p_joint.limit_upper) {
+		error = relative - p_joint.limit_upper;
+	} else if (relative < p_joint.limit_lower) {
+		error = relative - p_joint.limit_lower;
+	}
+	if (error == 0.0) {
+		return;
+	}
+	const real_t delta_lambda = -error / w_sum_angular;
+	a.rotation -= delta_lambda * a.inverse_inertia;
+	b.rotation += delta_lambda * b.inverse_inertia;
+}
+
+void ArticulatedBody2D::set_speed_limits(real_t p_linear, real_t p_angular) {
+	max_linear_speed = MAX(p_linear, (real_t)0.0);
+	max_angular_speed = MAX(p_angular, (real_t)0.0);
+}
+
+void ArticulatedBody2D::settle(int p_iterations) {
+	ERR_FAIL_COND(p_iterations < 1);
+	// Rigid pins and limits only: a compliant pin is a tether to somewhere the body needn't be yet, and drives are
+	// what the body moves toward over time, not where it is.
+	for (int iteration = 0; iteration < p_iterations; iteration++) {
+		for (const Joint &joint : joints) {
+			if (joint.pin_compliance == 0.0) {
+				_project_pin(joint, 0.0);
+			}
+			_project_limit(joint);
+		}
+	}
+	// Where the parts ended up is where they are now; none of it was motion.
+	for (Part &part : parts) {
+		part.previous_position = part.position;
+		part.previous_rotation = part.rotation;
+	}
+}
+
 void ArticulatedBody2D::step(real_t p_delta, int p_substeps) {
 	ERR_FAIL_COND(p_delta <= 0.0);
 	ERR_FAIL_COND(p_substeps < 1);
@@ -214,25 +308,7 @@ void ArticulatedBody2D::step(real_t p_delta, int p_substeps) {
 			Part &a = parts[joint.part_a];
 			Part &b = parts[joint.part_b];
 
-			// Pin: close the gap between the two anchors along the line between them. Each part moves and turns by
-			// its share of the correction, weighted by how much its anchor can move per unit of impulse.
-			const Vector2 r_a = joint.anchor_a.rotated(a.rotation);
-			const Vector2 r_b = joint.anchor_b.rotated(b.rotation);
-			const Vector2 gap = (a.position + r_a) - (b.position + r_b);
-			const real_t gap_length = gap.length();
-			if (gap_length > (real_t)CMP_EPSILON) {
-				const Vector2 normal = gap / gap_length;
-				const real_t lever_a = r_a.cross(normal);
-				const real_t lever_b = r_b.cross(normal);
-				const real_t w_sum = a.inverse_mass + a.inverse_inertia * lever_a * lever_a + b.inverse_mass + b.inverse_inertia * lever_b * lever_b;
-				if (w_sum > 0.0) {
-					const Vector2 correction = normal * (-gap_length / w_sum);
-					a.position += correction * a.inverse_mass;
-					a.rotation += a.inverse_inertia * r_a.cross(correction);
-					b.position -= correction * b.inverse_mass;
-					b.rotation -= b.inverse_inertia * r_b.cross(correction);
-				}
-			}
+			_project_pin(joint, joint.pin_compliance / h2);
 
 			const real_t w_sum_angular = a.inverse_inertia + b.inverse_inertia;
 			if (w_sum_angular <= 0.0) {
@@ -249,23 +325,8 @@ void ArticulatedBody2D::step(real_t p_delta, int p_substeps) {
 				b.rotation += delta_lambda * b.inverse_inertia;
 			}
 
-			// Limits: push the relative angle back inside its range, rigidly, after the drive so a limit wins over
-			// it. The angle is read around the middle of the range, so a range anywhere up to a full turn reads right.
-			if (joint.limit_enabled) {
-				const real_t middle = (joint.limit_lower + joint.limit_upper) * (real_t)0.5;
-				const real_t relative = middle + Math::wrapf(b.rotation - a.rotation - middle, (real_t)-Math::PI, (real_t)Math::PI);
-				real_t error = 0.0;
-				if (relative > joint.limit_upper) {
-					error = relative - joint.limit_upper;
-				} else if (relative < joint.limit_lower) {
-					error = relative - joint.limit_lower;
-				}
-				if (error != 0.0) {
-					const real_t delta_lambda = -error / w_sum_angular;
-					a.rotation -= delta_lambda * a.inverse_inertia;
-					b.rotation += delta_lambda * b.inverse_inertia;
-				}
-			}
+			// Limits come after the drive so a limit wins over it.
+			_project_limit(joint);
 		}
 
 		// Contacts: push each contact point back to its plane, then hold it there by friction. Static friction cancels
@@ -278,7 +339,7 @@ void ArticulatedBody2D::step(real_t p_delta, int p_substeps) {
 				continue;
 			}
 			const Vector2 r = contact.local_point.rotated(part.rotation);
-			const real_t depth = (part.position + r - contact.plane_point).dot(contact.plane_normal);
+			const real_t depth = (part.position + r - contact.plane_point).dot(contact.plane_normal) - part.radius;
 			if (depth >= 0.0) {
 				continue;
 			}
@@ -312,13 +373,20 @@ void ArticulatedBody2D::step(real_t p_delta, int p_substeps) {
 			}
 		}
 
-		// Velocity update: what the positions did over the substep is the velocity, constraints included.
+		// Velocity update: what the positions did over the substep is the velocity, constraints included. The caps
+		// are a safety net: a constraint that has to correct a lot at once would otherwise read as a huge velocity.
 		for (Part &part : parts) {
 			if (part.inverse_mass == 0.0) {
 				continue;
 			}
 			part.linear_velocity = (part.position - part.previous_position) / h;
 			part.angular_velocity = (part.rotation - part.previous_rotation) / h;
+			if (max_linear_speed > 0.0) {
+				part.linear_velocity = part.linear_velocity.limit_length(max_linear_speed);
+			}
+			if (max_angular_speed > 0.0) {
+				part.angular_velocity = CLAMP(part.angular_velocity, -max_angular_speed, max_angular_speed);
+			}
 		}
 
 		// Contact velocities: a touching point keeps no velocity into or out of its plane, so being pushed out of it
@@ -364,6 +432,8 @@ void ArticulatedBody2D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_part_count"), &ArticulatedBody2D::get_part_count);
 	ClassDB::bind_method(D_METHOD("set_part_transform", "part", "position", "rotation"), &ArticulatedBody2D::set_part_transform);
 	ClassDB::bind_method(D_METHOD("set_part_velocity", "part", "linear_velocity", "angular_velocity"), &ArticulatedBody2D::set_part_velocity);
+	ClassDB::bind_method(D_METHOD("set_part_radius", "part", "radius"), &ArticulatedBody2D::set_part_radius);
+	ClassDB::bind_method(D_METHOD("get_part_radius", "part"), &ArticulatedBody2D::get_part_radius);
 	ClassDB::bind_method(D_METHOD("get_part_position", "part"), &ArticulatedBody2D::get_part_position);
 	ClassDB::bind_method(D_METHOD("get_part_rotation", "part"), &ArticulatedBody2D::get_part_rotation);
 	ClassDB::bind_method(D_METHOD("get_part_linear_velocity", "part"), &ArticulatedBody2D::get_part_linear_velocity);
@@ -374,6 +444,7 @@ void ArticulatedBody2D::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("add_joint", "part_a", "part_b", "anchor_a", "anchor_b"), &ArticulatedBody2D::add_joint);
 	ClassDB::bind_method(D_METHOD("get_joint_count"), &ArticulatedBody2D::get_joint_count);
+	ClassDB::bind_method(D_METHOD("set_joint_pin_compliance", "joint", "compliance"), &ArticulatedBody2D::set_joint_pin_compliance);
 	ClassDB::bind_method(D_METHOD("set_joint_limits", "joint", "enabled", "lower", "upper"), &ArticulatedBody2D::set_joint_limits);
 	ClassDB::bind_method(D_METHOD("set_joint_drive", "joint", "target_angle", "compliance"), &ArticulatedBody2D::set_joint_drive);
 
@@ -384,6 +455,9 @@ void ArticulatedBody2D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_gravity", "gravity"), &ArticulatedBody2D::set_gravity);
 	ClassDB::bind_method(D_METHOD("get_gravity"), &ArticulatedBody2D::get_gravity);
 	ClassDB::bind_method(D_METHOD("set_damping", "linear", "angular"), &ArticulatedBody2D::set_damping);
+	ClassDB::bind_method(D_METHOD("set_speed_limits", "linear", "angular"), &ArticulatedBody2D::set_speed_limits);
+
+	ClassDB::bind_method(D_METHOD("settle", "iterations"), &ArticulatedBody2D::settle, DEFVAL(8));
 
 	ClassDB::bind_method(D_METHOD("step", "delta", "substeps"), &ArticulatedBody2D::step, DEFVAL(4));
 }

@@ -19,7 +19,7 @@
 			<param index="3" name="plane_normal" type="Vector2" />
 			<param index="4" name="friction" type="float" />
 			<description>
-				Keeps [param local_point], in [param part]'s local space, on the side of the plane through [param plane_point] that [param plane_normal] points to, with the given coefficient of [param friction] along the plane (zero slides freely, one holds about as hard as it is pushed). The normal need not be unit length. Returns the contact's index, or [code]-1[/code] if the part doesn't exist or the normal is zero. Contacts stay until [method clear_contacts], so a caller that casts for them every step clears them first.
+				Keeps [param local_point], in [param part]'s local space, at least the part's radius (see [method set_part_radius]) off the plane through [param plane_point], on the side [param plane_normal] points to, with the given coefficient of [param friction] along the plane (zero slides freely, one holds about as hard as it is pushed). The normal need not be unit length. Returns the contact's index, or [code]-1[/code] if the part doesn't exist or the normal is zero. Contacts stay until [method clear_contacts], so a caller that casts for them every step clears them first.
 			</description>
 		</method>
 		<method name="add_joint">
@@ -29,7 +29,7 @@
 			<param index="2" name="anchor_a" type="Vector2" />
 			<param index="3" name="anchor_b" type="Vector2" />
 			<description>
-				Pins [param part_a] and [param part_b] together at [param anchor_a] and [param anchor_b], each in its own part's local space. Returns the joint's index, or [code]-1[/code] if either part doesn't exist or both are the same. A new joint has no limits and no drive.
+				Pins [param part_a] and [param part_b] together at [param anchor_a] and [param anchor_b], each in its own part's local space. Returns the joint's index, or [code]-1[/code] if either part doesn't exist or both are the same. A new joint is pinned rigidly and has no limits and no drive.
 			</description>
 		</method>
 		<method name="add_part">
@@ -114,6 +114,13 @@
 				Returns every part's position, by part index.
 			</description>
 		</method>
+		<method name="get_part_radius" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="part" type="int" />
+			<description>
+				Returns [param part]'s radius, see [method set_part_radius].
+			</description>
+		</method>
 		<method name="get_part_rotation" qualifiers="const">
 			<return type="float" />
 			<param index="0" name="part" type="int" />
@@ -135,6 +142,21 @@
 				Sets how quickly linear and angular velocities decay, as the fraction lost per unit of time at low values. Negative values count as zero. Damping is applied implicitly, so any amount stays stable.
 			</description>
 		</method>
+		<method name="set_speed_limits">
+			<return type="void" />
+			<param index="0" name="linear" type="float" />
+			<param index="1" name="angular" type="float" />
+			<description>
+				Caps how fast any part may move and turn, in distance and radians per unit of time, as a safety net: a constraint that has to correct a lot in one substep, after the body was posed into it or its limits changed under it, would otherwise read as a huge velocity. Zero, the default for both, means no cap.
+			</description>
+		</method>
+		<method name="settle">
+			<return type="void" />
+			<param index="0" name="iterations" type="int" default="8" />
+			<description>
+				Projects the rigid pins and the limits [param iterations] times without any of the movement counting as velocity. Call it after posing the parts with [method set_part_transform], so a pose that doesn't quite fit the joints is pulled together quietly rather than snapping together on the first [method step]. Compliant pins and drives are left alone.
+			</description>
+		</method>
 		<method name="set_gravity">
 			<return type="void" />
 			<param index="0" name="gravity" type="Vector2" />
@@ -151,6 +173,14 @@
 				Makes [param joint] pull part b's rotation relative to part a toward [param target_angle], in radians, with the given [param compliance]: zero holds the angle rigidly, larger values let it give more under load, and a negative value switches the drive off. Compliance is in radians per unit of torque, so under a steady torque the joint settles about [code]compliance * torque[/code] away from its target; with masses and distances in the caller's units the useful values are correspondingly small. The target may change every step, which is how an animated pose drives the body.
 			</description>
 		</method>
+		<method name="set_joint_pin_compliance">
+			<return type="void" />
+			<param index="0" name="joint" type="int" />
+			<param index="1" name="compliance" type="float" />
+			<description>
+				Lets [param joint]'s two anchors part under load by the given [param compliance], in distance per unit of force: zero, the default, pins them rigidly, and under a steady force they settle about [code]compliance * force[/code] apart. Negative values count as zero. With an immovable part as one side this makes a soft tether, which holds a body loosely to where something else says it should be.
+			</description>
+		</method>
 		<method name="set_joint_limits">
 			<return type="void" />
 			<param index="0" name="joint" type="int" />
@@ -159,6 +189,14 @@
 			<param index="3" name="upper" type="float" />
 			<description>
 				Limits part b's rotation relative to part a at [param joint] to between [param lower] and [param upper], in radians, while [param enabled]. [param lower] must not exceed [param upper], and the range may be anywhere up to a full turn wide: the relative angle is read around the middle of the range. A limit is rigid and wins over the joint's drive.
+			</description>
+		</method>
+		<method name="set_part_radius">
+			<return type="void" />
+			<param index="0" name="part" type="int" />
+			<param index="1" name="radius" type="float" />
+			<description>
+				Sets how far [param part]'s contact points keep off their planes, which makes the part a capsule of that [param radius] around the segment between its points rather than a bare segment. Zero by default. Negative values count as zero.
 			</description>
 		</method>
 		<method name="set_part_transform">

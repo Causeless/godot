@@ -56,6 +56,7 @@ class ArticulatedBody2D : public RefCounted {
 		real_t angular_velocity = 0.0;
 		real_t inverse_mass = 0.0; // Zero for a part that never moves.
 		real_t inverse_inertia = 0.0;
+		real_t radius = 0.0; // How far the part's contact points keep off their planes: the part's thickness.
 	};
 
 	struct Joint {
@@ -63,6 +64,7 @@ class ArticulatedBody2D : public RefCounted {
 		int part_b = -1;
 		Vector2 anchor_a; // The pinned point, in each part's local space.
 		Vector2 anchor_b;
+		real_t pin_compliance = 0.0; // How much the anchors may part under load, zero for a rigid pin.
 		bool limit_enabled = false;
 		real_t limit_lower = 0.0; // Range of part b's rotation relative to part a, radians.
 		real_t limit_upper = 0.0;
@@ -85,6 +87,11 @@ class ArticulatedBody2D : public RefCounted {
 	Vector2 gravity;
 	real_t linear_damping = 0.0;
 	real_t angular_damping = 0.0;
+	real_t max_linear_speed = 0.0; // Caps on the velocities the velocity update may produce, zero for none.
+	real_t max_angular_speed = 0.0;
+
+	void _project_pin(const Joint &p_joint, real_t p_compliance_term);
+	void _project_limit(const Joint &p_joint);
 
 protected:
 	static void _bind_methods();
@@ -96,6 +103,8 @@ public:
 	int get_part_count() const;
 	void set_part_transform(int p_part, const Vector2 &p_position, real_t p_rotation);
 	void set_part_velocity(int p_part, const Vector2 &p_linear_velocity, real_t p_angular_velocity);
+	void set_part_radius(int p_part, real_t p_radius);
+	real_t get_part_radius(int p_part) const;
 	Vector2 get_part_position(int p_part) const;
 	real_t get_part_rotation(int p_part) const;
 	Vector2 get_part_linear_velocity(int p_part) const;
@@ -106,6 +115,7 @@ public:
 
 	int add_joint(int p_part_a, int p_part_b, const Vector2 &p_anchor_a, const Vector2 &p_anchor_b);
 	int get_joint_count() const;
+	void set_joint_pin_compliance(int p_joint, real_t p_compliance);
 	void set_joint_limits(int p_joint, bool p_enabled, real_t p_lower, real_t p_upper);
 	void set_joint_drive(int p_joint, real_t p_target_angle, real_t p_compliance);
 
@@ -116,6 +126,8 @@ public:
 	void set_gravity(const Vector2 &p_gravity);
 	Vector2 get_gravity() const;
 	void set_damping(real_t p_linear, real_t p_angular);
+	void set_speed_limits(real_t p_linear, real_t p_angular);
 
+	void settle(int p_iterations);
 	void step(real_t p_delta, int p_substeps);
 };
