@@ -39,8 +39,9 @@
 
 // A planar articulated body: rigid parts joined by pin joints, simulated with substepped extended position based
 // dynamics. A joint can be limited to a range of relative angles and driven toward a target relative angle with a
-// compliance, which is what lets the body hold a pose rigidly, follow one loosely or go limp, per joint. The caller
-// owns everything around it: it feeds targets, impulses and contacts each step and reads the part transforms back.
+// compliance, which is what lets the body hold a pose rigidly, follow one loosely or go limp, per joint. Contacts
+// are half-planes the caller found for points on the parts, held with friction and without bounce. The caller owns
+// everything around the body: it feeds targets, impulses and contacts each step and reads the part transforms back.
 // Nothing here touches the scene tree or the physics server, so a step can run anywhere and substep as often as
 // its stiffness needs.
 class ArticulatedBody2D : public RefCounted {
@@ -69,8 +70,18 @@ class ArticulatedBody2D : public RefCounted {
 		real_t drive_compliance = -1.0; // Negative while the drive is off, zero for a rigid drive.
 	};
 
+	struct Contact {
+		int part = -1;
+		Vector2 local_point; // The point on the part that must stay on the plane's near side, in the part's local space.
+		Vector2 plane_point;
+		Vector2 plane_normal; // Unit, pointing toward the side the point belongs on.
+		real_t friction = 0.0;
+		real_t lambda_normal = 0.0; // How hard the plane pushed this substep, as a positional impulse; zero when apart.
+	};
+
 	LocalVector<Part> parts;
 	LocalVector<Joint> joints;
+	LocalVector<Contact> contacts;
 	Vector2 gravity;
 	real_t linear_damping = 0.0;
 	real_t angular_damping = 0.0;
@@ -97,6 +108,10 @@ public:
 	int get_joint_count() const;
 	void set_joint_limits(int p_joint, bool p_enabled, real_t p_lower, real_t p_upper);
 	void set_joint_drive(int p_joint, real_t p_target_angle, real_t p_compliance);
+
+	void clear_contacts();
+	int add_contact(int p_part, const Vector2 &p_local_point, const Vector2 &p_plane_point, const Vector2 &p_plane_normal, real_t p_friction);
+	int get_contact_count() const;
 
 	void set_gravity(const Vector2 &p_gravity);
 	Vector2 get_gravity() const;

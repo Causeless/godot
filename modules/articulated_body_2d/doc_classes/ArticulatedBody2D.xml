@@ -5,11 +5,23 @@
 	</brief_description>
 	<description>
 		Simulates rigid parts pinned together by joints as one articulated body, using extended position based dynamics with substeps. Each joint can be limited to a range of relative angles and driven toward a target relative angle with a compliance, so the body can hold a pose rigidly, follow one loosely or hang limp, joint by joint, and the drives can be retuned at any time. Positions are in whatever units the caller uses, rotations in radians.
-		The body stands on its own: it is not a node and touches neither the scene tree nor the physics server. The caller adds parts and joints, feeds targets and impulses, calls [method step] and reads the part transforms back, so a step can run from any thread that owns the body and substep as often as its stiffness needs, independently of the engine's physics tick.
+		Contacts are half-planes given per point on a part, see [method add_contact]: the body finds nothing on its own, the caller casts against whatever it collides with and hands the planes over, typically once per step. A touching point is held on its plane without bounce, and by friction along it.
+		The body stands on its own: it is not a node and touches neither the scene tree nor the physics server. The caller adds parts and joints, feeds targets, impulses and contacts, calls [method step] and reads the part transforms back, so a step can run from any thread that owns the body and substep as often as its stiffness needs, independently of the engine's physics tick.
 	</description>
 	<tutorials>
 	</tutorials>
 	<methods>
+		<method name="add_contact">
+			<return type="int" />
+			<param index="0" name="part" type="int" />
+			<param index="1" name="local_point" type="Vector2" />
+			<param index="2" name="plane_point" type="Vector2" />
+			<param index="3" name="plane_normal" type="Vector2" />
+			<param index="4" name="friction" type="float" />
+			<description>
+				Keeps [param local_point], in [param part]'s local space, on the side of the plane through [param plane_point] that [param plane_normal] points to, with the given coefficient of [param friction] along the plane (zero slides freely, one holds about as hard as it is pushed). The normal need not be unit length. Returns the contact's index, or [code]-1[/code] if the part doesn't exist or the normal is zero. Contacts stay until [method clear_contacts], so a caller that casts for them every step clears them first.
+			</description>
+		</method>
 		<method name="add_joint">
 			<return type="int" />
 			<param index="0" name="part_a" type="int" />
@@ -43,6 +55,18 @@
 			<return type="void" />
 			<description>
 				Removes every part and joint.
+			</description>
+		</method>
+		<method name="clear_contacts">
+			<return type="void" />
+			<description>
+				Removes every contact. Parts and joints stay.
+			</description>
+		</method>
+		<method name="get_contact_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns how many contacts the body currently has.
 			</description>
 		</method>
 		<method name="get_gravity" qualifiers="const">
@@ -160,7 +184,7 @@
 			<param index="0" name="delta" type="float" />
 			<param index="1" name="substeps" type="int" default="4" />
 			<description>
-				Advances the body by [param delta] in [param substeps] equal substeps. Each substep integrates gravity and damping, projects the joint constraints and recovers the velocities from the motion, so more substeps make stiff drives and limits hold better at the same cost per constraint. Both arguments must be positive.
+				Advances the body by [param delta] in [param substeps] equal substeps. Each substep integrates gravity and damping, projects the joint constraints and then the contacts, recovers the velocities from the motion and takes the bounce and the slide the contacts don't allow back out of them, so more substeps make stiff drives, limits and contacts hold better at the same cost per constraint. Both arguments must be positive.
 			</description>
 		</method>
 	</methods>

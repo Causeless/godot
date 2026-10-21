@@ -38,6 +38,7 @@
 void ArticulatedBody2D::clear() {
 	parts.clear();
 	joints.clear();
+	contacts.clear();
 }
 
 int ArticulatedBody2D::add_part(const Vector2 &p_position, real_t p_rotation, real_t p_mass, real_t p_inertia) {
@@ -150,6 +151,27 @@ void ArticulatedBody2D::set_joint_drive(int p_joint, real_t p_target_angle, real
 	joints[p_joint].drive_compliance = p_compliance;
 }
 
+void ArticulatedBody2D::clear_contacts() {
+	contacts.clear();
+}
+
+int ArticulatedBody2D::add_contact(int p_part, const Vector2 &p_local_point, const Vector2 &p_plane_point, const Vector2 &p_plane_normal, real_t p_friction) {
+	ERR_FAIL_UNSIGNED_INDEX_V((uint32_t)p_part, parts.size(), -1);
+	ERR_FAIL_COND_V_MSG(p_plane_normal.is_zero_approx(), -1, "A contact plane needs a normal.");
+	Contact contact;
+	contact.part = p_part;
+	contact.local_point = p_local_point;
+	contact.plane_point = p_plane_point;
+	contact.plane_normal = p_plane_normal.normalized();
+	contact.friction = MAX(p_friction, (real_t)0.0);
+	contacts.push_back(contact);
+	return contacts.size() - 1;
+}
+
+int ArticulatedBody2D::get_contact_count() const {
+	return contacts.size();
+}
+
 void ArticulatedBody2D::set_gravity(const Vector2 &p_gravity) {
 	gravity = p_gravity;
 }
@@ -246,6 +268,50 @@ void ArticulatedBody2D::step(real_t p_delta, int p_substeps) {
 			}
 		}
 
+		// Contacts: push each contact point back to its plane, then hold it there by friction. Static friction cancels
+		// the point's slide over the substep outright when the normal push can account for it through the friction
+		// coefficient; otherwise the point slides and dynamic friction slows it in the velocity pass below.
+		for (Contact &contact : contacts) {
+			Part &part = parts[contact.part];
+			contact.lambda_normal = 0.0;
+			if (part.inverse_mass == 0.0) {
+				continue;
+			}
+			const Vector2 r = contact.local_point.rotated(part.rotation);
+			const real_t depth = (part.position + r - contact.plane_point).dot(contact.plane_normal);
+			if (depth >= 0.0) {
+				continue;
+			}
+			const real_t lever = r.cross(contact.plane_normal);
+			const real_t w = part.inverse_mass + part.inverse_inertia * lever * lever;
+			if (w <= 0.0) {
+				continue;
+			}
+			const real_t delta_lambda = -depth / w;
+			const Vector2 correction = contact.plane_normal * delta_lambda;
+			part.position += correction * part.inverse_mass;
+			part.rotation += part.inverse_inertia * r.cross(correction);
+			contact.lambda_normal = delta_lambda;
+
+			// Static friction, from how far the point slid along the plane since the substep began.
+			const Vector2 r_now = contact.local_point.rotated(part.rotation);
+			const Vector2 slide = (part.position + r_now) - (part.previous_position + contact.local_point.rotated(part.previous_rotation));
+			const Vector2 tangential = slide - contact.plane_normal * slide.dot(contact.plane_normal);
+			const real_t tangential_length = tangential.length();
+			if (tangential_length <= (real_t)CMP_EPSILON) {
+				continue;
+			}
+			const Vector2 tangent = tangential / tangential_length;
+			const real_t lever_t = r_now.cross(tangent);
+			const real_t w_t = part.inverse_mass + part.inverse_inertia * lever_t * lever_t;
+			const real_t needed = tangential_length / w_t; // The positional impulse that would undo the slide
+			if (needed <= contact.friction * contact.lambda_normal) {
+				const Vector2 hold = tangent * (-needed);
+				part.position += hold * part.inverse_mass;
+				part.rotation += part.inverse_inertia * r_now.cross(hold);
+			}
+		}
+
 		// Velocity update: what the positions did over the substep is the velocity, constraints included.
 		for (Part &part : parts) {
 			if (part.inverse_mass == 0.0) {
@@ -253,6 +319,40 @@ void ArticulatedBody2D::step(real_t p_delta, int p_substeps) {
 			}
 			part.linear_velocity = (part.position - part.previous_position) / h;
 			part.angular_velocity = (part.rotation - part.previous_rotation) / h;
+		}
+
+		// Contact velocities: a touching point keeps no velocity into or out of its plane, so being pushed out of it
+		// doesn't read as a bounce, and dynamic friction takes as much of its slide as the normal push allows.
+		for (const Contact &contact : contacts) {
+			if (contact.lambda_normal <= 0.0) {
+				continue;
+			}
+			Part &part = parts[contact.part];
+			const Vector2 r = contact.local_point.rotated(part.rotation);
+			const Vector2 point_velocity = part.linear_velocity + Vector2(-r.y, r.x) * part.angular_velocity;
+
+			const real_t normal_velocity = point_velocity.dot(contact.plane_normal);
+			if (normal_velocity != 0.0) {
+				const real_t lever = r.cross(contact.plane_normal);
+				const real_t w = part.inverse_mass + part.inverse_inertia * lever * lever;
+				const Vector2 impulse = contact.plane_normal * (-normal_velocity / w);
+				part.linear_velocity += impulse * part.inverse_mass;
+				part.angular_velocity += part.inverse_inertia * r.cross(impulse);
+			}
+
+			const Vector2 tangential_velocity = point_velocity - contact.plane_normal * normal_velocity;
+			const real_t tangential_speed = tangential_velocity.length();
+			if (tangential_speed <= (real_t)CMP_EPSILON || contact.friction <= 0.0) {
+				continue;
+			}
+			const Vector2 tangent = tangential_velocity / tangential_speed;
+			const real_t lever_t = r.cross(tangent);
+			const real_t w_t = part.inverse_mass + part.inverse_inertia * lever_t * lever_t;
+			// The normal push over the substep, as an impulse, bounds the friction impulse through the coefficient.
+			const real_t friction_impulse = MIN(contact.friction * contact.lambda_normal / h, tangential_speed / w_t);
+			const Vector2 impulse = tangent * (-friction_impulse);
+			part.linear_velocity += impulse * part.inverse_mass;
+			part.angular_velocity += part.inverse_inertia * r.cross(impulse);
 		}
 	}
 }
@@ -276,6 +376,10 @@ void ArticulatedBody2D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_joint_count"), &ArticulatedBody2D::get_joint_count);
 	ClassDB::bind_method(D_METHOD("set_joint_limits", "joint", "enabled", "lower", "upper"), &ArticulatedBody2D::set_joint_limits);
 	ClassDB::bind_method(D_METHOD("set_joint_drive", "joint", "target_angle", "compliance"), &ArticulatedBody2D::set_joint_drive);
+
+	ClassDB::bind_method(D_METHOD("clear_contacts"), &ArticulatedBody2D::clear_contacts);
+	ClassDB::bind_method(D_METHOD("add_contact", "part", "local_point", "plane_point", "plane_normal", "friction"), &ArticulatedBody2D::add_contact);
+	ClassDB::bind_method(D_METHOD("get_contact_count"), &ArticulatedBody2D::get_contact_count);
 
 	ClassDB::bind_method(D_METHOD("set_gravity", "gravity"), &ArticulatedBody2D::set_gravity);
 	ClassDB::bind_method(D_METHOD("get_gravity"), &ArticulatedBody2D::get_gravity);
