@@ -33,6 +33,7 @@
 #include "core/object/worker_thread_pool.h"
 #include "core/os/condition_variable.h"
 #include "core/os/mutex.h"
+#include "core/os/spin_lock.h"
 #include "core/templates/local_vector.h"
 #include "core/templates/tuple.h"
 #include "core/typedefs.h"
@@ -108,7 +109,11 @@ class CommandQueueMT {
 
 	inline static thread_local bool flushing = false;
 
+	// The mutex serializes flushers and guards the sync protocol (the counters below and the condition variable).
+	// The command buffer itself is guarded by the spin lock: a push holds it only to write one command, so many
+	// threads pushing at once spin for nanoseconds instead of sleeping and waking on the mutex.
 	BinaryMutex mutex;
+	SpinLock command_lock;
 	LocalVector<uint8_t> command_mem;
 	ConditionVariable sync_cond_var;
 	uint32_t sync_head = 0;
@@ -132,18 +137,28 @@ class CommandQueueMT {
 		pending.store(true);
 	}
 
+	template <typename T, typename... Args>
+	_FORCE_INLINE_ void _push_command(Args &&...p_args) {
+		command_lock.lock();
+		create_command<T>(std::forward<Args>(p_args)...);
+		WorkerThreadPool::TaskID pump = pump_task_id;
+		command_lock.unlock();
+
+		if (pump != WorkerThreadPool::INVALID_TASK_ID) {
+			WorkerThreadPool::get_singleton()->notify_yield_over(pump);
+		}
+	}
+
 	template <typename T, bool NeedsSync, typename... Args>
 	_FORCE_INLINE_ void _push_internal(Args &&...p_args) {
-		MutexLock mlock(mutex);
-		create_command<T>(std::forward<Args>(p_args)...);
-
-		if (pump_task_id != WorkerThreadPool::INVALID_TASK_ID) {
-			WorkerThreadPool::get_singleton()->notify_yield_over(pump_task_id);
-		}
-
 		if constexpr (NeedsSync) {
+			// Lock order is always mutex then spin lock, same as the flush.
+			MutexLock mlock(mutex);
+			_push_command<T>(std::forward<Args>(p_args)...);
 			sync_tail++;
 			_wait_for_sync(mlock);
+		} else {
+			_push_command<T>(std::forward<Args>(p_args)...);
 		}
 	}
 
@@ -176,16 +191,25 @@ class CommandQueueMT {
 
 		alignas(uint64_t) char cmd_local_mem[MAX_COMMAND_SIZE];
 
-		while (flush_read_ptr < command_mem.size()) {
+		while (true) {
+			// Pushes keep appending (and reallocating) while we run, so the buffer is only read under the spin
+			// lock and each command is copied out before it is called (see GH-100509).
+			command_lock.lock();
+			if (flush_read_ptr >= command_mem.size()) {
+				command_mem.clear();
+				pending.store(false);
+				flush_read_ptr = 0;
+				command_lock.unlock();
+				break;
+			}
+
 			uint64_t size = *(uint64_t *)&command_mem[flush_read_ptr];
 			flush_read_ptr += sizeof(uint64_t);
+			memcpy(cmd_local_mem, (char *)&command_mem[flush_read_ptr], size);
+			flush_read_ptr += size;
+			command_lock.unlock();
 
-			// Protect against race condition between this thread
-			// during the call to the command and other threads potentially
-			// invalidating the pointer due to reallocs by relocating the object (see GH-100509).
-			CommandBase *cmd_original = reinterpret_cast<CommandBase *>(&command_mem[flush_read_ptr]);
 			CommandBase *cmd_local = reinterpret_cast<CommandBase *>(cmd_local_mem);
-			memcpy(cmd_local_mem, (char *)cmd_original, size);
 
 			lock.temp_unlock();
 			cmd_local->call();
@@ -199,13 +223,7 @@ class CommandQueueMT {
 			}
 
 			cmd_local->~CommandBase();
-
-			flush_read_ptr += size;
 		}
-
-		command_mem.clear();
-		pending.store(false);
-		flush_read_ptr = 0;
 
 		_prevent_sync_wraparound();
 
@@ -270,8 +288,9 @@ public:
 	}
 
 	void set_pump_task_id(WorkerThreadPool::TaskID p_task_id) {
-		MutexLock lock(mutex);
+		command_lock.lock();
 		pump_task_id = p_task_id;
+		command_lock.unlock();
 	}
 
 	CommandQueueMT() {
