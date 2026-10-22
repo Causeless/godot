@@ -43,6 +43,8 @@
 #include "core/templates/safe_refcount.h"
 #include "core/variant/variant.h"
 
+#include <atomic>
+
 #define ADD_SIGNAL(m_signal) get_gdtype_static_mutable().add_signal(m_signal)
 #define ADD_PROPERTY(m_property, m_setter, m_getter) ::ClassDB::add_property(get_class_static(), m_property, StringName(m_setter), StringName(m_getter))
 #define ADD_PROPERTYI(m_property, m_setter, m_getter, m_index) ::ClassDB::add_property(get_class_static(), m_property, StringName(m_setter), StringName(m_getter), m_index)
@@ -886,19 +888,34 @@ class ObjectDB {
 #define OBJECTDB_SLOT_MAX_COUNT_BITS 24
 #define OBJECTDB_SLOT_MAX_COUNT_MASK ((uint64_t(1) << OBJECTDB_SLOT_MAX_COUNT_BITS) - 1)
 #define OBJECTDB_REFERENCE_BIT (uint64_t(1) << (OBJECTDB_SLOT_MAX_COUNT_BITS + OBJECTDB_VALIDATOR_BITS))
+#define OBJECTDB_CHUNK_BITS 12
+#define OBJECTDB_CHUNK_SIZE (uint32_t(1) << OBJECTDB_CHUNK_BITS)
+#define OBJECTDB_CHUNK_MASK (OBJECTDB_CHUNK_SIZE - 1)
+#define OBJECTDB_CHUNK_COUNT (uint32_t(1) << (OBJECTDB_SLOT_MAX_COUNT_BITS - OBJECTDB_CHUNK_BITS))
 
-	struct ObjectSlot { // 128 bits per slot.
-		uint64_t validator : OBJECTDB_VALIDATOR_BITS;
-		uint64_t next_free : OBJECTDB_SLOT_MAX_COUNT_BITS;
-		uint64_t is_ref_counted : 1;
-		Object *object = nullptr;
+	// Lookups take no lock, which matters because every object call from a script validates its target here.
+	// Slots live in fixed-size chunks that are allocated once and never move, each published with a release
+	// store before slot_max grows to cover it. A slot's validator and object are atomics that writers store in
+	// an order a reader can rely on: an add stores the object before the validator, a remove clears the
+	// validator before the object. A reader checks the validator, reads the object and checks the validator
+	// again, so a slot freed or reused mid-read reads as freed. Writers still serialize on the spin lock.
+	struct ObjectSlot {
+		std::atomic<uint64_t> validator;
+		std::atomic<Object *> object;
+		uint32_t next_free;
+		bool is_ref_counted;
 	};
 
 	static SpinLock spin_lock;
 	static uint32_t slot_count;
-	static uint32_t slot_max;
-	static ObjectSlot *object_slots;
+	static std::atomic<uint32_t> slot_max;
+	static std::atomic<ObjectSlot *> slot_chunks[OBJECTDB_CHUNK_COUNT];
 	static uint64_t validator_counter;
+
+	// Writer-side slot access, under the spin lock.
+	_ALWAYS_INLINE_ static ObjectSlot &_slot(uint32_t p_slot) {
+		return slot_chunks[p_slot >> OBJECTDB_CHUNK_BITS].load(std::memory_order_relaxed)[p_slot & OBJECTDB_CHUNK_MASK];
+	}
 
 	friend class Object;
 	friend void unregister_core_types();
@@ -917,20 +934,21 @@ public:
 		uint64_t id = p_instance_id;
 		uint32_t slot = id & OBJECTDB_SLOT_MAX_COUNT_MASK;
 
-		ERR_FAIL_COND_V(slot >= slot_max, nullptr); // This should never happen unless RID is corrupted.
+		// slot_max is published after the chunk it extends into, so a slot below it has its chunk visible.
+		ERR_FAIL_COND_V(slot >= slot_max.load(std::memory_order_acquire), nullptr); // This should never happen unless RID is corrupted.
 
-		spin_lock.lock();
-
+		const ObjectSlot &object_slot = slot_chunks[slot >> OBJECTDB_CHUNK_BITS].load(std::memory_order_acquire)[slot & OBJECTDB_CHUNK_MASK];
 		uint64_t validator = (id >> OBJECTDB_SLOT_MAX_COUNT_BITS) & OBJECTDB_VALIDATOR_MASK;
 
-		if (unlikely(object_slots[slot].validator != validator)) {
-			spin_lock.unlock();
+		if (unlikely(object_slot.validator.load(std::memory_order_acquire) != validator)) {
 			return nullptr;
 		}
 
-		Object *object = object_slots[slot].object;
+		Object *object = object_slot.object.load(std::memory_order_acquire);
 
-		spin_lock.unlock();
+		if (unlikely(object_slot.validator.load(std::memory_order_acquire) != validator)) {
+			return nullptr; // Freed, or freed and reused, while we were reading it.
+		}
 
 		return object;
 	}
