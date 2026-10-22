@@ -1207,6 +1207,9 @@ GodotPhysicsDirectSpaceState2D *GodotSpace2D::get_direct_state() {
 	return direct_access;
 }
 
+thread_local GodotCollisionObject2D *GodotSpace2D::intersection_query_results[GodotSpace2D::INTERSECTION_QUERY_MAX];
+thread_local int GodotSpace2D::intersection_query_subindex_results[GodotSpace2D::INTERSECTION_QUERY_MAX];
+
 GodotSpace2D::GodotSpace2D() {
 	body_linear_velocity_sleep_threshold = GLOBAL_GET("physics/2d/sleep_threshold_linear");
 	body_angular_velocity_sleep_threshold = GLOBAL_GET("physics/2d/sleep_threshold_angular");
