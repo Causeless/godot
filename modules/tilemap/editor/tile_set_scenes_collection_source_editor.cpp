@@ -227,9 +227,17 @@ void TileSetScenesCollectionSourceEditor::_tile_set_scenes_collection_source_cha
 	tile_set_scenes_collection_source_changed_needs_update = true;
 }
 
-void TileSetScenesCollectionSourceEditor::_scene_thumbnail_done(const String &p_path, const Ref<Texture2D> &p_preview, const Ref<Texture2D> &p_small_preview, int p_idx) {
-	if (p_idx >= 0 && p_idx < scene_tiles_list->get_item_count()) {
-		scene_tiles_list->set_item_icon(p_idx, p_preview);
+void TileSetScenesCollectionSourceEditor::_scene_thumbnail_done(const String &p_path, const Ref<Texture2D> &p_preview, const Ref<Texture2D> &p_small_preview, int p_scene_id) {
+	if (p_preview.is_null()) {
+		return;
+	}
+	// The list may have been rebuilt since the preview was requested, so look the tile up by ID.
+	for (int i = 0; i < scene_tiles_list->get_item_count(); i++) {
+		const Variant metadata = scene_tiles_list->get_item_metadata(i);
+		if (metadata.get_type() == Variant::INT && int(metadata) == p_scene_id) {
+			scene_tiles_list->set_item_icon(i, p_preview);
+			return;
+		}
 	}
 }
 
@@ -370,6 +378,15 @@ void TileSetScenesCollectionSourceEditor::_update_scenes_list() {
 	// Clear the list.
 	scene_tiles_list->clear();
 
+	// The display options are shared with the TileMap editor's scenes list, so reload them.
+	scene_tiles_grid_view = EditorSettings::get_singleton()->get_project_metadata("editor_metadata", "scene_tiles_grid_view", false);
+	scene_tiles_sort_by_name = EditorSettings::get_singleton()->get_project_metadata("editor_metadata", "scene_tiles_sort_by_name", false);
+	scene_tiles_thumbnail_size = EditorSettings::get_singleton()->get_project_metadata("editor_metadata", "scene_tiles_thumbnail_size", 64);
+	scene_tiles_grid_button->set_pressed_no_signal(scene_tiles_grid_view);
+	scene_tiles_sort_button->set_pressed_no_signal(scene_tiles_sort_by_name);
+	scene_tiles_size_slider->set_value_no_signal(scene_tiles_thumbnail_size);
+	scene_tiles_size_slider->set_visible(scene_tiles_grid_view);
+
 	// Layout: a grid of thumbnails with the name underneath, or one row per tile.
 	const int thumbnail_size = (scene_tiles_grid_view ? scene_tiles_thumbnail_size : int(EDITOR_GET("filesystem/file_dialog/thumbnail_size"))) * EDSCALE;
 	if (scene_tiles_grid_view) {
@@ -423,7 +440,16 @@ void TileSetScenesCollectionSourceEditor::_update_scenes_list() {
 			} else {
 				item_index = scene_tiles_list->add_item(details);
 			}
-			EditorResourcePreview::get_singleton()->queue_edited_resource_preview(entry.scene, callable_mp(this, &TileSetScenesCollectionSourceEditor::_scene_thumbnail_done).bind(item_index));
+			// The ID must be set before requesting the preview: a cached preview calls back synchronously.
+			scene_tiles_list->set_item_metadata(item_index, entry.scene_id);
+			// Previews by path are cached on disk and invalidated when the scene file is saved;
+			// previews of the in-memory resource would not notice a re-save.
+			const Callable thumbnail_done = callable_mp(this, &TileSetScenesCollectionSourceEditor::_scene_thumbnail_done).bind(entry.scene_id);
+			if (entry.scene->get_path().is_resource_file()) {
+				EditorResourcePreview::get_singleton()->queue_resource_preview(entry.scene->get_path(), thumbnail_done);
+			} else {
+				EditorResourcePreview::get_singleton()->queue_edited_resource_preview(entry.scene, thumbnail_done);
+			}
 		} else {
 			item_index = scene_tiles_list->add_item(TTR("Tile with Invalid Scene"), get_editor_theme_icon(SNAME("PackedScene")));
 		}

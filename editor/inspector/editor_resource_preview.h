@@ -82,6 +82,7 @@ class EditorResourcePreview : public Node {
 		Ref<Resource> resource;
 		String path;
 		Callable callback;
+		uint64_t frame = 0; // Process frame the request was made in. Newer batches are served first.
 	};
 
 	List<QueueItem> queue;

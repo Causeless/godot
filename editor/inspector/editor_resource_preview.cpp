@@ -30,6 +30,7 @@
 
 #include "editor_resource_preview.h"
 
+#include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/io/file_access.h"
 #include "core/io/resource_loader.h"
@@ -292,8 +293,16 @@ void EditorResourcePreview::_iterate() {
 		return;
 	}
 
-	QueueItem item = queue.front()->get();
-	queue.pop_front();
+	// Serve the most recent batch of requests first, in the order they were made. What the user
+	// just opened matters more than the backlog from a dock that queued every file it lists.
+	List<QueueItem>::Element *best = queue.front();
+	for (List<QueueItem>::Element *E = best->next(); E; E = E->next()) {
+		if (E->get().frame > best->get().frame) {
+			best = E;
+		}
+	}
+	QueueItem item = best->get();
+	queue.erase(best);
 
 	if (cache.has(item.path)) {
 		Item cached_item = cache[item.path];
@@ -509,6 +518,7 @@ void EditorResourcePreview::queue_edited_resource_preview(const Ref<Resource> &p
 		item.resource = p_res;
 		item.path = path_id;
 		item.callback = p_callback;
+		item.frame = Engine::get_singleton()->get_process_frames();
 		queue.push_back(item);
 	}
 	preview_sem.post();
@@ -534,6 +544,7 @@ void EditorResourcePreview::queue_resource_preview(const String &p_path, const C
 		QueueItem item;
 		item.path = p_path;
 		item.callback = p_callback;
+		item.frame = Engine::get_singleton()->get_process_frames();
 		queue.push_back(item);
 	}
 	preview_sem.post();

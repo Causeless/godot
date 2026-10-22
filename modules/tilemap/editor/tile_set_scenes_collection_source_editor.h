@@ -129,7 +129,7 @@ private:
 
 	void _tile_set_scenes_collection_source_changed();
 	void _scenes_collection_source_proxy_object_changed(const String &p_what, const Ref<TileSetScenesCollectionProxyObject> &p_object);
-	void _scene_thumbnail_done(const String &p_path, const Ref<Texture2D> &p_preview, const Ref<Texture2D> &p_small_preview, int p_idx);
+	void _scene_thumbnail_done(const String &p_path, const Ref<Texture2D> &p_preview, const Ref<Texture2D> &p_small_preview, int p_scene_id);
 	void _scenes_list_item_activated(int p_index);
 	void _scenes_list_gui_input(const Ref<InputEvent> &p_event);
 	void _scenes_list_sort_toggled(bool p_pressed);
