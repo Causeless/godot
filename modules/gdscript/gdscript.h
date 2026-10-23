@@ -629,6 +629,11 @@ public:
 	virtual void reload_scripts(const Array &p_scripts) override;
 	virtual void reload_tool_script(const Ref<Script> &p_script) override;
 
+	// Resets every `GDScriptFunction::CallSiteCache`. Must run before a script's functions are
+	// deleted (they may be cached by call sites in any other function) and after a script becomes
+	// valid again (sites poisoned while it was invalid get another chance).
+	void invalidate_call_caches();
+
 	virtual void frame() override;
 
 	virtual void get_public_functions(List<MethodInfo> *r_functions) const override;

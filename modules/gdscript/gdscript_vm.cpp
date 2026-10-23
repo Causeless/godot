@@ -496,6 +496,68 @@ void (*type_init_function_table[])(Variant *) = {
 #define METHOD_CALL_ON_NULL_VALUE_ERROR(method_pointer) "Cannot call method '" + (method_pointer)->get_name() + "' on a null value."
 #define METHOD_CALL_ON_FREED_INSTANCE_ERROR(method_pointer) "Cannot call method '" + (method_pointer)->get_name() + "' on a previously freed instance."
 
+// Lock-free fast path for `OPCODE_CALL*`. Returns true if the call was performed.
+bool GDScriptFunction::_call_cache_try(CallSiteCache &p_cache, const Variant *p_base, const Variant **p_args, int p_argcount, Variant &r_ret, Callable::CallError &r_err) {
+	const uintptr_t key = p_cache.key.load(std::memory_order_acquire);
+	if (key < CallSiteCache::FIRST_KEY) {
+		return false; // Empty or poisoned.
+	}
+
+	// A receiver that doesn't match the cached script makes the site polymorphic; give up on it.
+	// Done as an exchange from the observed key so a concurrent reset to EMPTY isn't overwritten.
+	auto poison = [&p_cache, key]() {
+		uintptr_t expected = key;
+		p_cache.key.compare_exchange_strong(expected, CallSiteCache::POISONED, std::memory_order_relaxed);
+	};
+
+	if (unlikely(p_base->get_type() != Variant::OBJECT)) {
+		poison();
+		return false;
+	}
+
+#ifdef DEBUG_ENABLED
+	Object *obj = p_base->get_validated_object();
+	if (unlikely(!obj)) {
+		return false; // Freed object, let the regular path report it.
+	}
+#else
+	Object *obj = *p_base;
+#endif
+
+	GDScriptInstance *instance = nullptr;
+	ScriptInstance *si = obj->get_script_instance();
+	if (si) {
+		if (unlikely((uintptr_t)si->get_script() != key)) {
+			poison();
+			return false;
+		}
+#ifdef TOOLS_ENABLED
+		// A placeholder instance reports the same script but isn't a `GDScriptInstance`.
+		if (unlikely(!reinterpret_cast<GDScript *>(key)->placeholders.is_empty())) {
+			return false;
+		}
+#endif
+		instance = static_cast<GDScriptInstance *>(si);
+	} else if (unlikely((uintptr_t)obj != key)) {
+		// Not the class itself either.
+		poison();
+		return false;
+	}
+
+	GDScriptFunction *function = p_cache.function.load(std::memory_order_relaxed);
+	if (!instance && unlikely(!function->is_static())) {
+		// Cached from an instance, now called on the class: not a valid static call.
+		poison();
+		return false;
+	}
+
+#ifdef DEBUG_ENABLED
+	_ObjectDebugLock debug_lock(obj); // Same guard `Object::callp()` holds.
+#endif
+	r_ret = function->call(instance, p_args, p_argcount, r_err);
+	return true;
+}
+
 Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_args, int p_argcount, Callable::CallError &r_err, CallState *p_state) {
 	GodotProfileZoneScript(this, source, name, name, _initial_line);
 
@@ -1928,7 +1990,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				bool call_async = (_code_ptr[ip]) == OPCODE_CALL_ASYNC;
 #endif
 				LOAD_INSTRUCTION_ARGS
-				CHECK_SPACE(3 + instr_arg_count);
+				CHECK_SPACE(4 + instr_arg_count);
 
 				ip += instr_arg_count;
 
@@ -1938,6 +2000,10 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				int methodname_idx = _code_ptr[ip + 2];
 				GD_ERR_BREAK(methodname_idx < 0 || methodname_idx >= _global_names_count);
 				const StringName *methodname = &_global_names_ptr[methodname_idx];
+
+				int call_cache_idx = _code_ptr[ip + 3];
+				GD_ERR_BREAK(call_cache_idx < 0 || call_cache_idx >= _call_caches_count);
+				CallSiteCache &call_cache = call_caches[call_cache_idx];
 
 				GodotProfileZoneScriptSystemCall(methodname, source, name, *methodname, line);
 
@@ -1956,9 +2022,14 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				Variant temp_ret;
 				Callable::CallError err;
+				if (!_call_cache_try(call_cache, base, (const Variant **)argptrs, argc, temp_ret, err)) {
+					if (call_cache.key.load(std::memory_order_relaxed) == CallSiteCache::EMPTY) {
+						_call_cache_fill(call_cache, base, *methodname);
+					}
+					base->callp(*methodname, (const Variant **)argptrs, argc, temp_ret, err);
+				}
 				if (call_ret) {
 					GET_INSTRUCTION_ARG(ret, argc + 1);
-					base->callp(*methodname, (const Variant **)argptrs, argc, temp_ret, err);
 					*ret = temp_ret;
 #ifdef DEBUG_ENABLED
 					if (ret->get_type() == Variant::NIL) {
@@ -1992,8 +2063,6 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 						}
 					}
 #endif
-				} else {
-					base->callp(*methodname, (const Variant **)argptrs, argc, temp_ret, err);
 				}
 #ifdef DEBUG_ENABLED
 
@@ -2049,7 +2118,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				}
 #endif // DEBUG_ENABLED
 
-				ip += 3;
+				ip += 4;
 			}
 			DISPATCH_OPCODE;
 

@@ -1192,3 +1192,23 @@ public:
 #define EXTRACT_PARAM_OR_FAIL_V(m_name, m_param, m_retval) TMPL_EXTRACT_PARAM_OR_FAIL(m_name, m_param, m_retval, "", false)
 #define EXTRACT_PARAM_OR_FAIL_V_MSG(m_name, m_param, m_retval, m_msg) TMPL_EXTRACT_PARAM_OR_FAIL(m_name, m_param, m_retval, m_msg, false)
 #define EXTRACT_PARAM_OR_FAIL_V_EDMSG(m_name, m_param, m_retval, m_msg) TMPL_EXTRACT_PARAM_OR_FAIL(m_name, m_param, m_retval, m_msg, true)
+
+#ifdef DEBUG_ENABLED
+// Marks the object as being called or emitting while alive, so `Object::free()` can refuse
+// to delete it from inside such a call. Declared here so script VMs that bypass
+// `Object::callp()` can keep the same protection.
+struct _ObjectDebugLock {
+	ObjectID obj_id;
+
+	_ObjectDebugLock(Object *p_obj) {
+		obj_id = p_obj->get_instance_id();
+		p_obj->_lock_index.ref();
+	}
+	~_ObjectDebugLock() {
+		Object *obj_ptr = ObjectDB::get_instance(obj_id);
+		if (likely(obj_ptr)) {
+			obj_ptr->_lock_index.unref();
+		}
+	}
+};
+#endif // DEBUG_ENABLED

@@ -371,6 +371,14 @@ GDScriptFunction *GDScriptByteCodeGenerator::write_end() {
 		function->_gds_utilities_count = 0;
 	}
 
+	if (call_cache_count) {
+		function->call_caches = memnew_arr(GDScriptFunction::CallSiteCache, call_cache_count);
+		function->_call_caches_count = call_cache_count;
+	} else {
+		function->call_caches = nullptr;
+		function->_call_caches_count = 0;
+	}
+
 	if (method_bind_map.size()) {
 		function->methods.resize(method_bind_map.size());
 		function->_methods_ptr = function->methods.ptrw();
@@ -1093,6 +1101,7 @@ void GDScriptByteCodeGenerator::write_call(const Address &p_target, const Addres
 		append(Address());
 		append(p_arguments.size());
 		append(p_function_name);
+		append(call_cache_count++);
 	} else {
 		append_opcode_and_argcount(GDScriptFunction::OPCODE_CALL_RETURN, 2 + p_arguments.size());
 		for (int i = 0; i < p_arguments.size(); i++) {
@@ -1103,6 +1112,7 @@ void GDScriptByteCodeGenerator::write_call(const Address &p_target, const Addres
 		append(ct.target);
 		append(p_arguments.size());
 		append(p_function_name);
+		append(call_cache_count++);
 		ct.cleanup();
 	}
 }
@@ -1129,6 +1139,7 @@ void GDScriptByteCodeGenerator::write_call_async(const Address &p_target, const 
 	append(ct.target);
 	append(p_arguments.size());
 	append(p_function_name);
+	append(call_cache_count++);
 	ct.cleanup();
 }
 
@@ -1363,6 +1374,7 @@ void GDScriptByteCodeGenerator::write_call_self(const Address &p_target, const S
 		append(Address());
 		append(p_arguments.size());
 		append(p_function_name);
+		append(call_cache_count++);
 	} else {
 		append_opcode_and_argcount(GDScriptFunction::OPCODE_CALL_RETURN, 2 + p_arguments.size());
 		for (int i = 0; i < p_arguments.size(); i++) {
@@ -1373,6 +1385,7 @@ void GDScriptByteCodeGenerator::write_call_self(const Address &p_target, const S
 		append(ct.target);
 		append(p_arguments.size());
 		append(p_function_name);
+		append(call_cache_count++);
 		ct.cleanup();
 	}
 }
@@ -1387,6 +1400,7 @@ void GDScriptByteCodeGenerator::write_call_self_async(const Address &p_target, c
 	append(ct.target);
 	append(p_arguments.size());
 	append(p_function_name);
+	append(call_cache_count++);
 	ct.cleanup();
 }
 

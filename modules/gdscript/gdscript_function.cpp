@@ -34,6 +34,7 @@
 
 #include "core/object/class_db.h"
 #include "core/variant/container_type_validate.h"
+#include "scene/scene_string_names.h"
 
 bool GDScriptDataType::is_type_exact(const ContainerType &p_container_type) const {
 	if (p_container_type.script.is_valid()) {
@@ -203,14 +204,76 @@ void GDScriptFunction::debug_get_stack_member_state(int p_line, List<Pair<String
 	}
 }
 
+void GDScriptFunction::_call_cache_fill(CallSiteCache &p_cache, const Variant *p_base, const StringName &p_method) {
+	// Serialized with cache resets so a function pointer is never published for a script
+	// whose functions are being deleted or replaced.
+	MutexLock lock(GDScriptLanguage::get_singleton()->mutex);
+
+	if (p_cache.key.load(std::memory_order_relaxed) != CallSiteCache::EMPTY) {
+		return; // Another thread got here first.
+	}
+
+	uintptr_t new_key = CallSiteCache::POISONED;
+	GDScriptFunction *found = nullptr;
+
+	// `_ready` has implicit behavior in `GDScriptInstance::callp`, so it always takes the regular path.
+	if (p_base->get_type() == Variant::OBJECT && p_method != SceneStringName(_ready)) {
+		Object *obj = p_base->get_validated_object();
+		if (obj) {
+			GDScript *script = nullptr;
+			bool static_receiver = false;
+
+			ScriptInstance *si = obj->get_script_instance();
+			if (si) {
+				if (!si->is_placeholder() && si->get_language() == GDScriptLanguage::get_singleton()) {
+					script = Object::cast_to<GDScript>(si->get_script());
+				}
+			} else {
+				// Calling on the class itself, e.g. `MyClass.some_static()`.
+				script = Object::cast_to<GDScript>(obj);
+				static_receiver = true;
+			}
+
+			if (script) {
+				// Same walk as `GDScriptInstance::callp` / `GDScript::callp`.
+				for (GDScript *sptr = script; sptr; sptr = sptr->base.ptr()) {
+					if (likely(sptr->valid)) {
+						HashMap<StringName, GDScriptFunction *>::Iterator E = sptr->member_functions.find(p_method);
+						if (E) {
+							found = E->value;
+							break;
+						}
+					}
+				}
+
+				if (found && (!static_receiver || found->is_static())) {
+					new_key = (uintptr_t)script;
+				} else {
+					found = nullptr;
+				}
+			}
+		}
+	}
+
+	if (found) {
+		p_cache.function.store(found, std::memory_order_relaxed);
+	}
+	p_cache.key.store(new_key, std::memory_order_release);
+}
+
+void GDScriptFunction::_call_caches_reset() {
+	// Caller holds `GDScriptLanguage::mutex`.
+	for (int i = 0; i < _call_caches_count; i++) {
+		call_caches[i].key.store(CallSiteCache::EMPTY, std::memory_order_relaxed);
+	}
+}
+
 GDScriptFunction::GDScriptFunction() {
 	name = "<anonymous>";
-#ifdef DEBUG_ENABLED
 	{
 		MutexLock lock(GDScriptLanguage::get_singleton()->mutex);
 		GDScriptLanguage::get_singleton()->function_list.add(&function_list);
 	}
-#endif
 }
 
 GDScriptFunction::~GDScriptFunction() {
@@ -226,10 +289,14 @@ GDScriptFunction::~GDScriptFunction() {
 
 	return_type.script_type_ref = Ref<Script>();
 
-#ifdef DEBUG_ENABLED
+	if (call_caches) {
+		memdelete_arr(call_caches);
+		call_caches = nullptr;
+		_call_caches_count = 0;
+	}
+
 	MutexLock lock(GDScriptLanguage::get_singleton()->mutex);
 	GDScriptLanguage::get_singleton()->function_list.remove(&function_list);
-#endif
 }
 
 /////////////////////

@@ -44,21 +44,6 @@
 
 #ifdef DEBUG_ENABLED
 
-struct _ObjectDebugLock {
-	ObjectID obj_id;
-
-	_ObjectDebugLock(Object *p_obj) {
-		obj_id = p_obj->get_instance_id();
-		p_obj->_lock_index.ref();
-	}
-	~_ObjectDebugLock() {
-		Object *obj_ptr = ObjectDB::get_instance(obj_id);
-		if (likely(obj_ptr)) {
-			obj_ptr->_lock_index.unref();
-		}
-	}
-};
-
 #define OBJ_DEBUG_LOCK _ObjectDebugLock _debug_lock(this);
 
 #else
