@@ -265,7 +265,10 @@ public:
 	FUNC2(body_set_pickable, RID, bool);
 
 	bool body_test_motion(RID p_body, const PS2DT::MotionParameters &p_parameters, PS2DT::MotionResult *r_result = nullptr) override {
-		ERR_FAIL_COND_V(!Thread::is_main_thread(), false);
+		// A direct call. While the server runs on the main thread any thread may make it: the motion test only reads
+		// body and shape data, and the server guards its own pending shape updates. With a physics thread, only the
+		// main thread and the server thread may call it.
+		ERR_FAIL_COND_V(create_thread && !Thread::is_main_thread() && Thread::get_caller_id() != server_thread, false);
 		return physics_server_2d->body_test_motion(p_body, p_parameters, r_result);
 	}
 
