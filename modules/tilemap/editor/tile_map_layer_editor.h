@@ -52,6 +52,7 @@ class TileMapLayer;
 class TileMapLayerEditor;
 class TileSetSourceItemList;
 class GridContainer;
+class HSlider;
 
 class SwitchSeparator : public MarginContainer {
 	GDCLASS(SwitchSeparator, MarginContainer);
@@ -235,12 +236,26 @@ private:
 	void _set_source_sort(int p_sort);
 
 	// Scenes collection sources.
+	VBoxContainer *scene_tiles_container = nullptr;
 	ItemList *scene_tiles_list = nullptr;
+	Button *scene_tiles_sort_button = nullptr;
+	Button *scene_tiles_grid_button = nullptr;
+	HSlider *scene_tiles_size_slider = nullptr;
+
+	// Display options of the scenes list, shared with the TileSet editor and remembered per project.
+	bool scene_tiles_grid_view = false;
+	bool scene_tiles_sort_by_name = false;
+	int scene_tiles_thumbnail_size = 64;
 
 	void _update_scenes_collection_view();
-	void _scene_thumbnail_done(const String &p_path, const Ref<Texture2D> &p_preview, const Ref<Texture2D> &p_small_preview, int p_index);
+	void _scene_thumbnail_done(const String &p_path, const Ref<Texture2D> &p_preview, const Ref<Texture2D> &p_small_preview, int p_scene_id);
 	void _scenes_list_multi_selected(int p_index, bool p_selected);
 	void _scenes_list_lmb_empty_clicked(const Vector2 &p_pos, MouseButton p_mouse_button_index);
+	void _scenes_list_gui_input(const Ref<InputEvent> &p_event);
+	void _scenes_list_sort_toggled(bool p_pressed);
+	void _scenes_list_grid_toggled(bool p_pressed);
+	void _scenes_list_thumbnail_size_changed(float p_value);
+	void _save_scenes_list_options();
 
 	///// Bottom panel patterns ////
 	MarginContainer *patterns_mc = nullptr;

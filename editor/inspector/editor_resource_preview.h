@@ -75,13 +75,14 @@ public:
 class EditorResourcePreview : public Node {
 	GDCLASS(EditorResourcePreview, Node);
 
-	static constexpr int CURRENT_METADATA_VERSION = 1; // Increment this number to invalidate all previews.
+	static constexpr int CURRENT_METADATA_VERSION = 2; // Increment this number to invalidate all previews.
 	inline static EditorResourcePreview *singleton = nullptr;
 
 	struct QueueItem {
 		Ref<Resource> resource;
 		String path;
 		Callable callback;
+		uint64_t frame = 0; // Process frame the request was made in. Newer batches are served first.
 	};
 
 	List<QueueItem> queue;

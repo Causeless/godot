@@ -1365,7 +1365,22 @@ void GodotPhysicsServer2D::finish() {
 	memdelete(stepper);
 }
 
+void GodotPhysicsServer2D::_add_pending_shape_update(SelfList<GodotCollisionObject2D> *p_element) {
+	MutexLock lock(pending_shape_update_mutex);
+	if (!p_element->in_list()) {
+		pending_shape_update_list.add(p_element);
+	}
+}
+
+void GodotPhysicsServer2D::_remove_pending_shape_update(SelfList<GodotCollisionObject2D> *p_element) {
+	MutexLock lock(pending_shape_update_mutex);
+	if (p_element->in_list()) {
+		pending_shape_update_list.remove(p_element);
+	}
+}
+
 void GodotPhysicsServer2D::_update_shapes() {
+	MutexLock lock(pending_shape_update_mutex);
 	while (pending_shape_update_list.first()) {
 		pending_shape_update_list.first()->self()->_shape_changed();
 		pending_shape_update_list.remove(pending_shape_update_list.first());

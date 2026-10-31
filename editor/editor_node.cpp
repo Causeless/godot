@@ -2298,8 +2298,8 @@ void EditorNode::_save_edited_subresources(Node *scene, HashMap<Ref<Resource>, b
 	}
 }
 
-void EditorNode::_find_node_types(Node *p_node, int &count_2d, int &count_3d) {
-	if (p_node->is_class("Viewport") || (p_node != editor_data.get_edited_scene_root() && p_node->get_owner() != editor_data.get_edited_scene_root())) {
+void EditorNode::_find_node_types(Node *p_node, Node *p_root, int &count_2d, int &count_3d) {
+	if (p_node->is_class("Viewport") || (p_node != p_root && p_node->get_owner() != p_root)) {
 		return;
 	}
 
@@ -2310,37 +2310,32 @@ void EditorNode::_find_node_types(Node *p_node, int &count_2d, int &count_3d) {
 	}
 
 	for (int i = 0; i < p_node->get_child_count(); i++) {
-		_find_node_types(p_node->get_child(i), count_2d, count_3d);
+		_find_node_types(p_node->get_child(i), p_root, count_2d, count_3d);
 	}
 }
 
 void EditorNode::_save_scene_with_preview(String p_file, int p_idx) {
 	save_scene_progress = memnew(EditorProgress("save", TTR("Saving Scene"), 4));
 
-	if (editor_data.get_edited_scene_root() != nullptr) {
+	Node *scene_to_save = editor_data.get_edited_scene_root(p_idx);
+	// The editor viewport only shows the current scene, so a thumbnail can only be captured for that one.
+	const bool is_current_scene = p_idx == -1 || p_idx == editor_data.get_edited_scene();
+
+	if (scene_to_save != nullptr && is_current_scene) {
 		save_scene_progress->step(TTR("Analyzing"), 0);
 
 		int c2d = 0;
 		int c3d = 0;
 
-		_find_node_types(editor_data.get_edited_scene_root(), c2d, c3d);
+		_find_node_types(scene_to_save, scene_to_save, c2d, c3d);
 
 		save_scene_progress->step(TTR("Creating Thumbnail"), 1);
 		// Current view?
 
 		Ref<Image> img;
-		// If neither 3D or 2D nodes are present, make a 1x1 black texture.
-		// We cannot fallback on the 2D editor, because it may not have been used yet,
-		// which would result in an invalid texture.
-		if (c3d == 0 && c2d == 0) {
-			img.instantiate();
-			img->initialize_data(1, 1, false, Image::FORMAT_RGB8);
-		} else if (c3d < c2d) {
-			Ref<ViewportTexture> viewport_texture = scene_root->get_texture();
-			if (viewport_texture->get_width() > 0 && viewport_texture->get_height() > 0) {
-				img = viewport_texture->get_image();
-			}
-		} else {
+		// 2D scenes are rendered by the preview generator instead (see EditorPackedScenePreviewPlugin),
+		// so only 3D scenes capture the editor viewport here.
+		if (c3d > 0 && c3d >= c2d) {
 			// The 3D editor may be disabled as a feature, but scenes can still be opened.
 			// This check prevents the preview from regenerating in case those scenes are then saved.
 			// The preview will be generated if no feature profile is set (as the 3D editor is enabled by default).

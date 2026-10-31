@@ -39,6 +39,8 @@
 #include "core/templates/self_list.h"
 #include "core/variant/variant.h"
 
+#include <atomic>
+
 struct ContainerType;
 class GDScriptInstance;
 class GDScript;
@@ -384,6 +386,35 @@ private:
 	Vector<GDScriptUtilityFunctions::FunctionPtr> gds_utilities;
 	Vector<const MethodBind *> methods;
 	Vector<GDScriptFunction *> lambdas;
+
+	// Per call site cache for `OPCODE_CALL`, `OPCODE_CALL_RETURN` and `OPCODE_CALL_ASYNC`.
+	// Remembers which GDScript function a receiver of a given script resolved to, so later
+	// calls from the same site with a receiver of the same script skip the method lookup
+	// through the script inheritance chain. One site caches a single receiver script; a site
+	// that sees several is poisoned and falls back to the regular lookup for good.
+	//
+	// Threading: hits are lock-free (acquire load of the key, then the function pointer).
+	// Fills and resets are serialized by `GDScriptLanguage::mutex`, so a function pointer
+	// is never published for a script whose functions are being replaced.
+	struct CallSiteCache {
+		enum : uintptr_t {
+			// Nothing resolved yet.
+			EMPTY = 0,
+			// Receivers of different scripts, a non-GDScript target, or a special method. Permanent slow path.
+			POISONED = 1,
+			// Anything from here on is the address of the receiver's GDScript.
+			FIRST_KEY = 2,
+		};
+		std::atomic<uintptr_t> key{ EMPTY };
+		std::atomic<GDScriptFunction *> function{ nullptr };
+	};
+
+	CallSiteCache *call_caches = nullptr;
+	int _call_caches_count = 0;
+
+	_FORCE_INLINE_ static bool _call_cache_try(CallSiteCache &p_cache, const Variant *p_base, const Variant **p_args, int p_argcount, Variant &r_ret, Callable::CallError &r_err);
+	static void _call_cache_fill(CallSiteCache &p_cache, const Variant *p_base, const StringName &p_method);
+	void _call_caches_reset();
 
 	int _code_size = 0;
 	int _default_arg_count = 0;

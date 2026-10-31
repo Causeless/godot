@@ -2736,6 +2736,10 @@ Error GDScriptCompiler::_prepare_compilation(GDScript *p_script, const GDScriptP
 		member_functions.insert(E.key, E.value);
 	}
 	p_script->member_functions.clear();
+
+	// Call sites anywhere may still point at the functions deleted below.
+	GDScriptLanguage::get_singleton()->invalidate_call_caches();
+
 	for (const KeyValue<StringName, GDScriptFunction *> &E : member_functions) {
 		memdelete(E.value);
 	}
@@ -3096,6 +3100,8 @@ Error GDScriptCompiler::_compile_class(GDScript *p_script, const GDScriptParser:
 #endif // DEBUG_ENABLED
 
 	p_script->valid = true;
+	// Sites that resolved against this script while it was invalid are poisoned; let them retry.
+	GDScriptLanguage::get_singleton()->invalidate_call_caches();
 	return OK;
 }
 

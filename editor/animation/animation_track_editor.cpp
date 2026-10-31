@@ -6822,12 +6822,14 @@ void AnimationTrackEditor::_anim_copy_keys(bool p_cut) {
 void AnimationTrackEditor::_set_key_clipboard(int p_top_track, float p_top_time, RBMap<SelectedKey, KeyInfo> &p_keys) {
 	key_clipboard.keys.clear();
 	key_clipboard.top_track = p_top_track;
+	key_clipboard.source_animation = animation->get_instance_id();
 	for (RBMap<SelectedKey, KeyInfo>::Element *E = p_keys.back(); E; E = E->prev()) {
 		KeyClipboard::Key k;
 		k.value = animation->track_get_key_value(E->key().track, E->key().key);
 		k.transition = animation->track_get_key_transition(E->key().track, E->key().key);
 		k.time = E->value().pos - p_top_time;
 		k.track = E->key().track - p_top_track;
+		k.path = animation->track_get_path(E->key().track);
 		k.track_type = animation->track_get_type(E->key().track);
 		if (k.track_type == Animation::TYPE_BEZIER) {
 			k.handle_mode = animation->bezier_track_get_key_handle_mode(E->key().track, E->key().key);
@@ -6845,31 +6847,74 @@ void AnimationTrackEditor::_anim_paste_keys(float p_ofs, bool p_ofs_valid, int p
 			start_track = is_valid_track_selected ? _get_track_selected() : key_clipboard.top_track;
 		}
 
-		bool all_compatible = true;
+		// Target track of each clipboard key, or -1 if it has none and gets skipped.
+		Vector<int> dst_tracks;
+		bool any_track_found = false;
 
-		for (int i = 0; i < key_clipboard.keys.size(); i++) {
-			const KeyClipboard::Key key = key_clipboard.keys[i];
+		// Track order can differ between animations, so keys from another animation go by path.
+		if (key_clipboard.source_animation != animation->get_instance_id()) {
+			for (int i = 0; i < key_clipboard.keys.size(); i++) {
+				const KeyClipboard::Key key = key_clipboard.keys[i];
 
-			int dst_track = key.track + start_track;
+				int dst_track = -1;
+				for (int j = 0; j < animation->get_track_count(); j++) {
+					if (animation->track_get_path(j) == key.path && _is_track_compatible(j, key.value.get_type(), key.track_type)) {
+						dst_track = j;
+						any_track_found = true;
+						break;
+					}
+				}
 
-			if (dst_track < 0 || dst_track >= animation->get_track_count()) {
-				all_compatible = false;
-				break;
-			}
-
-			if (!_is_track_compatible(dst_track, key.value.get_type(), key.track_type)) {
-				all_compatible = false;
-				break;
+				dst_tracks.push_back(dst_track);
 			}
 		}
 
-		ERR_FAIL_COND_MSG(!all_compatible, "Paste failed: Not all animation keys were compatible with their target tracks");
+		// Within one animation, or with no path in common, keys go by their offset from the start track.
+		if (!any_track_found) {
+			dst_tracks.clear();
+
+			for (int i = 0; i < key_clipboard.keys.size(); i++) {
+				const KeyClipboard::Key key = key_clipboard.keys[i];
+
+				int dst_track = key.track + start_track;
+				bool is_track_valid = dst_track >= 0 && dst_track < animation->get_track_count() && _is_track_compatible(dst_track, key.value.get_type(), key.track_type);
+
+				dst_tracks.push_back(is_track_valid ? dst_track : -1);
+			}
+		}
+
+		int skipped_key_count = 0;
+		Vector<String> skipped_paths;
+
+		for (int i = 0; i < key_clipboard.keys.size(); i++) {
+			if (dst_tracks[i] == -1) {
+				skipped_key_count++;
+
+				String skipped_path = String(key_clipboard.keys[i].path);
+				if (!skipped_paths.has(skipped_path)) {
+					skipped_paths.push_back(skipped_path);
+				}
+			}
+		}
+
+		if (skipped_key_count > 0) {
+			ERR_PRINT(vformat("Paste incomplete: Skipped %d of %d animation keys with no compatible target track: %s", skipped_key_count, key_clipboard.keys.size(), String(", ").join(skipped_paths)));
+		}
+
+		if (skipped_key_count == key_clipboard.keys.size()) {
+			return;
+		}
 
 		EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
 		undo_redo->create_action(TTR("Animation Paste Keys"));
 		List<Pair<int, float>> new_selection_values;
 
 		for (int i = 0; i < key_clipboard.keys.size(); i++) {
+			int dst_track = dst_tracks[i];
+			if (dst_track == -1) {
+				continue;
+			}
+
 			const KeyClipboard::Key key = key_clipboard.keys[i];
 
 			float insert_pos = p_ofs_valid ? p_ofs : timeline->get_play_position();
@@ -6881,7 +6926,6 @@ void AnimationTrackEditor::_anim_paste_keys(float p_ofs, bool p_ofs_valid, int p
 			}
 
 			float dst_time = key.time + insert_pos;
-			int dst_track = key.track + start_track;
 
 			int existing_idx = animation->track_find_key(dst_track, dst_time, Animation::FIND_MODE_APPROX);
 

@@ -816,6 +816,7 @@ Error GDScript::reload(bool p_keep_state) {
 #endif
 
 	valid = false;
+	GDScriptLanguage::get_singleton()->invalidate_call_caches();
 	GDScriptParser parser;
 	Error err;
 	if (!binary_tokens.is_empty()) {
@@ -1497,6 +1498,9 @@ void GDScript::clear() {
 		_clear_doc();
 	}
 #endif
+
+	// Call sites anywhere may still point at these functions.
+	GDScriptLanguage::singleton->invalidate_call_caches();
 
 	// All dependencies have been accounted for
 	for (GDScriptFunction *E : functions_to_clear) {
@@ -2640,6 +2644,13 @@ void GDScriptLanguage::_prepare_script_for_reload(const Ref<GDScript> &p_script,
 	}
 }
 #endif
+
+void GDScriptLanguage::invalidate_call_caches() {
+	MutexLock lock(mutex);
+	for (SelfList<GDScriptFunction> *E = function_list.first(); E; E = E->next()) {
+		E->self()->_call_caches_reset();
+	}
+}
 
 void GDScriptLanguage::reload_tool_script(const Ref<Script> &p_script) {
 	Array scripts = { p_script };

@@ -591,6 +591,7 @@ void AnimationMixer::_clear_caches(bool p_clear_track_cache) {
 	if (!p_clear_track_cache) {
 		return;
 	}
+	_release_cached_target_nodes();
 	for (KeyValue<Animation::TrackCacheID, TrackCache *> &K : track_cache) {
 		memdelete(K.value);
 	}
@@ -754,6 +755,7 @@ bool AnimationMixer::_update_caches() {
 							track_value->object_id = resource->get_instance_id();
 						} else {
 							track_value->object_id = child->get_instance_id();
+							_cache_track_target(track_value, child);
 						}
 
 						track_value->is_using_angle = anim->track_get_interpolation_type(i) == Animation::INTERPOLATION_LINEAR_ANGLE || anim->track_get_interpolation_type(i) == Animation::INTERPOLATION_CUBIC_ANGLE || anim->track_get_interpolation_type(i) == Animation::INTERPOLATION_MAKIMA_ANGLE;
@@ -905,6 +907,7 @@ bool AnimationMixer::_update_caches() {
 							track_method->object_id = resource->get_instance_id();
 						} else {
 							track_method->object_id = child->get_instance_id();
+							_cache_track_target(track_method, child);
 						}
 
 						track = track_method;
@@ -914,6 +917,7 @@ bool AnimationMixer::_update_caches() {
 						TrackCacheAudio *track_audio = memnew(TrackCacheAudio);
 
 						track_audio->object_id = child->get_instance_id();
+						_cache_track_target(track_audio, child);
 						track_audio->audio_stream.instantiate();
 						track_audio->audio_stream->set_polyphony(audio_max_polyphony);
 						track_audio->playback_type = (AuSE::PlaybackType)(int)(child->call(SNAME("get_playback_type")));
@@ -926,6 +930,7 @@ bool AnimationMixer::_update_caches() {
 						TrackCacheAnimation *track_animation = memnew(TrackCacheAnimation);
 
 						track_animation->object_id = child->get_instance_id();
+						_cache_track_target(track_animation, child);
 
 						track = track_animation;
 
@@ -1017,6 +1022,35 @@ bool AnimationMixer::_update_caches() {
 	cache_valid = true;
 
 	return true;
+}
+
+// Caches the target pointer on the track when the node is inside the tree, where its tree_exiting signal tells us
+// to drop it. A node outside the tree can be freed without that signal, so it keeps the per-blend ObjectDB lookup.
+void AnimationMixer::_cache_track_target(TrackCache *p_track, Node *p_node) {
+	if (!p_node->is_inside_tree()) {
+		return;
+	}
+	p_track->object = p_node;
+
+	ObjectID node_id = p_node->get_instance_id();
+	if (cached_target_nodes.find(node_id) == -1) {
+		cached_target_nodes.push_back(node_id);
+		p_node->connect(SceneStringName(tree_exiting), callable_mp(this, &AnimationMixer::_cached_target_node_exiting_tree));
+	}
+}
+
+void AnimationMixer::_release_cached_target_nodes() {
+	for (const ObjectID &node_id : cached_target_nodes) {
+		Node *node = ObjectDB::get_instance<Node>(node_id); // A freed node already dropped the connection with itself.
+		if (node && node->is_connected(SceneStringName(tree_exiting), callable_mp(this, &AnimationMixer::_cached_target_node_exiting_tree))) {
+			node->disconnect(SceneStringName(tree_exiting), callable_mp(this, &AnimationMixer::_cached_target_node_exiting_tree));
+		}
+	}
+	cached_target_nodes.clear();
+}
+
+void AnimationMixer::_cached_target_node_exiting_tree() {
+	_clear_caches();
 }
 
 /* -------------------------------------------- */
@@ -1684,7 +1718,7 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
 							t->use_discrete = true;
 							Variant value = a->track_get_key_value(i, idx);
 							value = post_process_key_value(a, i, value, t->object_id);
-							Object *t_obj = ObjectDB::get_instance(t->object_id);
+							Object *t_obj = t->get_object();
 							if (t_obj) {
 								t_obj->set_indexed(t->subpath, value);
 							}
@@ -1695,7 +1729,7 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
 								t->use_discrete = true;
 								Variant value = a->track_get_key_value(i, F);
 								value = post_process_key_value(a, i, value, t->object_id);
-								Object *t_obj = ObjectDB::get_instance(t->object_id);
+								Object *t_obj = t->get_object();
 								if (t_obj) {
 									t_obj->set_indexed(t->subpath, value);
 								}
@@ -1720,21 +1754,21 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
 						}
 						StringName method = a->method_track_get_name(i, idx);
 						Vector<Variant> params = a->method_track_get_params(i, idx);
-						_call_object(t->object_id, method, params, callback_mode_method == ANIMATION_CALLBACK_MODE_METHOD_DEFERRED);
+						_call_object(t->get_object(), method, params, callback_mode_method == ANIMATION_CALLBACK_MODE_METHOD_DEFERRED);
 					} else {
 						LocalVector<int> indices;
 						a->track_get_key_indices_in_range(i, time, delta, start, end, &indices, looped_flag);
 						for (int &F : indices) {
 							StringName method = a->method_track_get_name(i, F);
 							Vector<Variant> params = a->method_track_get_params(i, F);
-							_call_object(t->object_id, method, params, callback_mode_method == ANIMATION_CALLBACK_MODE_METHOD_DEFERRED);
+							_call_object(t->get_object(), method, params, callback_mode_method == ANIMATION_CALLBACK_MODE_METHOD_DEFERRED);
 						}
 					}
 				} break;
 				case Animation::TYPE_AUDIO: {
 					// The end of audio should be observed even if the blend value is 0, build up the information and store to the cache for that.
 					TrackCacheAudio *t = static_cast<TrackCacheAudio *>(track);
-					Object *t_obj = ObjectDB::get_instance(t->object_id);
+					Object *t_obj = t->get_object();
 					Node *asp = t_obj ? Object::cast_to<Node>(t_obj) : nullptr;
 					if (!t_obj || !asp) {
 						t->playing_streams.clear();
@@ -1836,7 +1870,7 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
 						continue;
 					}
 					TrackCacheAnimation *t = static_cast<TrackCacheAnimation *>(track);
-					Object *t_obj = ObjectDB::get_instance(t->object_id);
+					Object *t_obj = t->get_object();
 					if (!t_obj) {
 						continue;
 					}
@@ -2015,7 +2049,7 @@ void AnimationMixer::_blend_apply() {
 					}
 				}
 
-				Object *t_obj = ObjectDB::get_instance(t->object_id);
+				Object *t_obj = t->get_object();
 				if (t_obj) {
 					t_obj->set_indexed(t->subpath, Animation::cast_from_blendwise(t->value, t->init_value.get_type()));
 				}
@@ -2085,7 +2119,7 @@ void AnimationMixer::_blend_apply() {
 	}
 }
 
-void AnimationMixer::_call_object(ObjectID p_object_id, const StringName &p_method, const Vector<Variant> &p_params, bool p_deferred) {
+void AnimationMixer::_call_object(Object *p_object, const StringName &p_method, const Vector<Variant> &p_params, bool p_deferred) {
 	// Separate function to use alloca() more efficiently
 	const Variant **argptrs = (const Variant **)alloca(sizeof(Variant *) * p_params.size());
 	const Variant *args = p_params.ptr();
@@ -2093,15 +2127,14 @@ void AnimationMixer::_call_object(ObjectID p_object_id, const StringName &p_meth
 	for (uint32_t i = 0; i < argcount; i++) {
 		argptrs[i] = &args[i];
 	}
-	Object *t_obj = ObjectDB::get_instance(p_object_id);
-	if (!t_obj) {
+	if (!p_object) {
 		return;
 	}
 	if (p_deferred) {
-		Callable(t_obj, p_method).call_deferredp(argptrs, argcount);
+		Callable(p_object, p_method).call_deferredp(argptrs, argcount);
 	} else {
 		Callable::CallError ce;
-		t_obj->callp(p_method, argptrs, argcount, ce);
+		p_object->callp(p_method, argptrs, argcount, ce);
 	}
 }
 

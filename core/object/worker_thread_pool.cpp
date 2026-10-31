@@ -30,6 +30,7 @@
 
 #include "worker_thread_pool.h"
 
+#include "core/debugger/engine_debugger.h"
 #include "core/object/class_db.h"
 #include "core/object/message_queue.h"
 #include "core/object/script_language.h"
@@ -123,6 +124,7 @@ void WorkerThreadPool::_process_task(Task *p_task) {
 		if (do_post) {
 			p_task->group->done_semaphore.post();
 			p_task->group->completed.set_to(true);
+			_notify_main_thread_waiter();
 		}
 		uint32_t max_users = p_task->group->tasks_used + 1; // Add 1 because the thread waiting for it is also user. Read before to avoid another thread freeing task after increment.
 		uint32_t finished_users = p_task->group->finished.increment();
@@ -152,6 +154,7 @@ void WorkerThreadPool::_process_task(Task *p_task) {
 		p_task->pool_thread_index = -1;
 		if (p_task->waiting_user) {
 			p_task->done_semaphore.post(p_task->waiting_user);
+			_notify_main_thread_waiter();
 		}
 		// Let awaiters know.
 		for (uint32_t i = 0; i < threads.size(); i++) {
@@ -452,7 +455,7 @@ Error WorkerThreadPool::wait_for_task_completion(TaskID p_task_id) {
 		}
 	} else {
 		task_mutex.unlock();
-		task->done_semaphore.wait();
+		_wait_for_done_semaphore(task->done_semaphore, false);
 		task_mutex.lock();
 		task->waiting_user--;
 		if (task->waiting_pool == 0 && task->waiting_user == 0) {
@@ -463,6 +466,56 @@ Error WorkerThreadPool::wait_for_task_completion(TaskID p_task_id) {
 
 	task_mutex.unlock();
 	return OK;
+}
+
+// Blocks on a task or group done semaphore. On the main thread with a debugger attached, it also wakes up to service
+// debugger messages addressed to the main thread: the editor sends remote inspection and similar requests there, and
+// if the awaited task is the one sitting on a breakpoint, nothing else would ever answer them.
+void WorkerThreadPool::_wait_for_done_semaphore(const Semaphore &p_semaphore, bool p_relock_unlockable_mutexes) {
+	if (!Thread::is_main_thread() || !EngineDebugger::is_active()) {
+		p_semaphore.wait();
+		return;
+	}
+
+	main_thread_waits.increment();
+	while (true) {
+		{
+			MutexLock lock(main_waiter_mutex);
+			if (p_semaphore.try_wait()) {
+				break;
+			}
+			if (!main_debugger_messages_pending) {
+				main_waiter_cond_var.wait(lock);
+				continue;
+			}
+			main_debugger_messages_pending = false;
+		}
+
+		// Message handlers may touch the servers, so hold the same locks the caller normally holds.
+		if (p_relock_unlockable_mutexes) {
+			_lock_unlockable_mutexes();
+		}
+		EngineDebugger::get_singleton()->poll_events(false);
+		if (p_relock_unlockable_mutexes) {
+			_unlock_unlockable_mutexes();
+		}
+	}
+	main_thread_waits.decrement();
+}
+
+void WorkerThreadPool::_notify_main_thread_waiter() {
+	if (main_thread_waits.get() == 0) {
+		return;
+	}
+
+	MutexLock lock(main_waiter_mutex);
+	main_waiter_cond_var.notify_all();
+}
+
+void WorkerThreadPool::notify_main_thread_debugger_messages() {
+	MutexLock lock(main_waiter_mutex);
+	main_debugger_messages_pending = true;
+	main_waiter_cond_var.notify_all();
 }
 
 void WorkerThreadPool::_lock_unlockable_mutexes() {
@@ -737,7 +790,7 @@ void WorkerThreadPool::wait_for_group_task_completion(GroupID p_group) {
 		if (this == singleton) {
 			_unlock_unlockable_mutexes();
 		}
-		group->done_semaphore.wait();
+		_wait_for_done_semaphore(group->done_semaphore, this == singleton);
 		if (this == singleton) {
 			_lock_unlockable_mutexes();
 		}

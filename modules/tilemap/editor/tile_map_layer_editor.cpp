@@ -48,7 +48,9 @@
 #include "editor/settings/editor_command_palette.h"
 #include "editor/settings/editor_settings.h"
 #include "editor/themes/editor_scale.h"
+#include "scene/gui/button.h"
 #include "scene/gui/grid_container.h"
+#include "scene/gui/slider.h"
 #include "scene/gui/split_container.h"
 #include "scene/main/scene_tree.h"
 
@@ -303,18 +305,18 @@ void TileMapLayerEditorTilesPlugin::_update_source_display() {
 		TileSetScenesCollectionSource *scenes_collection_source = Object::cast_to<TileSetScenesCollectionSource>(source);
 
 		if (atlas_source) {
-			scene_tiles_list->hide();
+			scene_tiles_container->hide();
 			invalid_source_label->hide();
 			tile_atlas_view->show();
 			_update_atlas_view();
 		} else if (scenes_collection_source) {
 			tile_atlas_view->hide();
 			invalid_source_label->hide();
-			scene_tiles_list->show();
+			scene_tiles_container->show();
 			_update_scenes_collection_view();
 		} else {
 			tile_atlas_view->hide();
-			scene_tiles_list->hide();
+			scene_tiles_container->hide();
 			invalid_source_label->show();
 		}
 	} else {
@@ -322,7 +324,7 @@ void TileMapLayerEditorTilesPlugin::_update_source_display() {
 		missing_source_label->show();
 
 		tile_atlas_view->hide();
-		scene_tiles_list->hide();
+		scene_tiles_container->hide();
 		invalid_source_label->hide();
 	}
 }
@@ -445,23 +447,84 @@ void TileMapLayerEditorTilesPlugin::_update_scenes_collection_view() {
 	// Clear the list.
 	scene_tiles_list->clear();
 
-	// Rebuild the list.
+	// The display options are shared with the TileSet editor's scenes list, so reload them.
+	scene_tiles_grid_view = EditorSettings::get_singleton()->get_project_metadata("editor_metadata", "scene_tiles_grid_view", false);
+	scene_tiles_sort_by_name = EditorSettings::get_singleton()->get_project_metadata("editor_metadata", "scene_tiles_sort_by_name", false);
+	scene_tiles_thumbnail_size = EditorSettings::get_singleton()->get_project_metadata("editor_metadata", "scene_tiles_thumbnail_size", 64);
+	scene_tiles_grid_button->set_pressed_no_signal(scene_tiles_grid_view);
+	scene_tiles_sort_button->set_pressed_no_signal(scene_tiles_sort_by_name);
+	scene_tiles_size_slider->set_value_no_signal(scene_tiles_thumbnail_size);
+	scene_tiles_size_slider->set_visible(scene_tiles_grid_view);
+
+	// Layout: a grid of thumbnails with the name underneath, or one row per tile.
+	const int thumbnail_size = (scene_tiles_grid_view ? scene_tiles_thumbnail_size : int(EDITOR_GET("filesystem/file_dialog/thumbnail_size"))) * EDSCALE;
+	if (scene_tiles_grid_view) {
+		scene_tiles_list->set_icon_mode(ItemList::ICON_MODE_TOP);
+		scene_tiles_list->set_max_columns(0);
+		scene_tiles_list->set_fixed_column_width(thumbnail_size * 3 / 2);
+		scene_tiles_list->set_max_text_lines(2);
+	} else {
+		scene_tiles_list->set_icon_mode(ItemList::ICON_MODE_LEFT);
+		scene_tiles_list->set_max_columns(1);
+		scene_tiles_list->set_fixed_column_width(0);
+		scene_tiles_list->set_max_text_lines(1);
+	}
+	scene_tiles_list->set_fixed_icon_size(Vector2(thumbnail_size, thumbnail_size));
+
+	// Collect the tiles, in ID order or sorted by name.
+	struct SceneTileEntry {
+		int scene_id = -1;
+		Ref<PackedScene> scene;
+		String name;
+	};
+	struct SceneTileNameComparator {
+		bool operator()(const SceneTileEntry &p_a, const SceneTileEntry &p_b) const {
+			const int cmp = p_a.name.naturalnocasecmp_to(p_b.name);
+			return cmp != 0 ? cmp < 0 : p_a.scene_id < p_b.scene_id;
+		}
+	};
+	LocalVector<SceneTileEntry> entries;
 	for (int i = 0; i < scenes_collection_source->get_scene_tiles_count(); i++) {
-		int scene_id = scenes_collection_source->get_scene_tile_id(i);
+		SceneTileEntry entry;
+		entry.scene_id = scenes_collection_source->get_scene_tile_id(i);
+		entry.scene = scenes_collection_source->get_scene_tile_scene(entry.scene_id);
+		if (entry.scene.is_valid()) {
+			entry.name = entry.scene->get_path().get_file().get_basename();
+		}
+		entries.push_back(entry);
+	}
+	if (scene_tiles_sort_by_name) {
+		entries.sort_custom<SceneTileNameComparator>();
+	}
 
-		Ref<PackedScene> scene = scenes_collection_source->get_scene_tile_scene(scene_id);
-
+	// Rebuild the list.
+	for (const SceneTileEntry &entry : entries) {
 		int item_index = 0;
-		if (scene.is_valid()) {
-			item_index = scene_tiles_list->add_item(vformat("%s (Path: %s, ID: %d)", scene->get_path().get_file().get_basename(), scene->get_path(), scene_id));
-			EditorResourcePreview::get_singleton()->queue_edited_resource_preview(scene, callable_mp(this, &TileMapLayerEditorTilesPlugin::_scene_thumbnail_done).bind(i));
+		if (entry.scene.is_valid()) {
+			const String details = vformat("%s (Path: %s, ID: %d)", entry.name, entry.scene->get_path(), entry.scene_id);
+			if (scene_tiles_grid_view) {
+				item_index = scene_tiles_list->add_item(entry.name);
+				scene_tiles_list->set_item_tooltip(item_index, details);
+			} else {
+				item_index = scene_tiles_list->add_item(details);
+			}
+			// The ID must be set before requesting the preview: a cached preview calls back synchronously.
+			scene_tiles_list->set_item_metadata(item_index, entry.scene_id);
+			// Previews by path are cached on disk and invalidated when the scene file is saved;
+			// previews of the in-memory resource would not notice a re-save.
+			const Callable thumbnail_done = callable_mp(this, &TileMapLayerEditorTilesPlugin::_scene_thumbnail_done).bind(entry.scene_id);
+			if (entry.scene->get_path().is_resource_file()) {
+				EditorResourcePreview::get_singleton()->queue_resource_preview(entry.scene->get_path(), thumbnail_done);
+			} else {
+				EditorResourcePreview::get_singleton()->queue_edited_resource_preview(entry.scene, thumbnail_done);
+			}
 		} else {
 			item_index = scene_tiles_list->add_item(TTR("Tile with Invalid Scene"), tiles_bottom_panel->get_editor_theme_icon(SNAME("PackedScene")));
 		}
-		scene_tiles_list->set_item_metadata(item_index, scene_id);
+		scene_tiles_list->set_item_metadata(item_index, entry.scene_id);
 
 		// Check if in selection.
-		if (tile_set_selection.has(TileMapCell(source_id, Vector2i(), scene_id))) {
+		if (tile_set_selection.has(TileMapCell(source_id, Vector2i(), entry.scene_id))) {
 			scene_tiles_list->select(item_index, false);
 		}
 	}
@@ -469,16 +532,58 @@ void TileMapLayerEditorTilesPlugin::_update_scenes_collection_view() {
 		scene_tiles_list->add_item(TTR("The selected scene collection source has no scenes. Add scenes in the TileSet bottom tab."));
 		scene_tiles_list->set_item_disabled(-1, true);
 	}
-
-	// Icon size update.
-	int int_size = int(EDITOR_GET("filesystem/file_dialog/thumbnail_size")) * EDSCALE;
-	scene_tiles_list->set_fixed_icon_size(Vector2(int_size, int_size));
 }
 
-void TileMapLayerEditorTilesPlugin::_scene_thumbnail_done(const String &p_path, const Ref<Texture2D> &p_preview, const Ref<Texture2D> &p_small_preview, int p_index) {
-	if (p_index >= 0 && p_index < scene_tiles_list->get_item_count()) {
-		scene_tiles_list->set_item_icon(p_index, p_preview);
+void TileMapLayerEditorTilesPlugin::_scene_thumbnail_done(const String &p_path, const Ref<Texture2D> &p_preview, const Ref<Texture2D> &p_small_preview, int p_scene_id) {
+	if (p_preview.is_null()) {
+		return;
 	}
+	// The list may have been rebuilt since the preview was requested, so look the tile up by ID.
+	for (int i = 0; i < scene_tiles_list->get_item_count(); i++) {
+		const Variant metadata = scene_tiles_list->get_item_metadata(i);
+		if (metadata.get_type() == Variant::INT && int(metadata) == p_scene_id) {
+			scene_tiles_list->set_item_icon(i, p_preview);
+			return;
+		}
+	}
+}
+
+void TileMapLayerEditorTilesPlugin::_scenes_list_gui_input(const Ref<InputEvent> &p_event) {
+	// Ctrl + mouse wheel resizes the thumbnails in grid view.
+	const Ref<InputEventMouseButton> mb = p_event;
+	if (mb.is_valid() && mb->is_pressed() && mb->is_command_or_control_pressed() && scene_tiles_grid_view) {
+		if (mb->get_button_index() == MouseButton::WHEEL_UP) {
+			scene_tiles_size_slider->set_value(scene_tiles_thumbnail_size + 16);
+			scene_tiles_list->accept_event();
+		} else if (mb->get_button_index() == MouseButton::WHEEL_DOWN) {
+			scene_tiles_size_slider->set_value(scene_tiles_thumbnail_size - 16);
+			scene_tiles_list->accept_event();
+		}
+	}
+}
+
+void TileMapLayerEditorTilesPlugin::_scenes_list_sort_toggled(bool p_pressed) {
+	scene_tiles_sort_by_name = p_pressed;
+	_save_scenes_list_options();
+	_update_scenes_collection_view();
+}
+
+void TileMapLayerEditorTilesPlugin::_scenes_list_grid_toggled(bool p_pressed) {
+	scene_tiles_grid_view = p_pressed;
+	_save_scenes_list_options();
+	_update_scenes_collection_view();
+}
+
+void TileMapLayerEditorTilesPlugin::_scenes_list_thumbnail_size_changed(float p_value) {
+	scene_tiles_thumbnail_size = p_value;
+	_save_scenes_list_options();
+	_update_scenes_collection_view();
+}
+
+void TileMapLayerEditorTilesPlugin::_save_scenes_list_options() {
+	EditorSettings::get_singleton()->set_project_metadata("editor_metadata", "scene_tiles_grid_view", scene_tiles_grid_view);
+	EditorSettings::get_singleton()->set_project_metadata("editor_metadata", "scene_tiles_sort_by_name", scene_tiles_sort_by_name);
+	EditorSettings::get_singleton()->set_project_metadata("editor_metadata", "scene_tiles_thumbnail_size", scene_tiles_thumbnail_size);
 }
 
 void TileMapLayerEditorTilesPlugin::_scenes_list_multi_selected(int p_index, bool p_selected) {
@@ -531,6 +636,8 @@ void TileMapLayerEditorTilesPlugin::_scenes_list_lmb_empty_clicked(const Vector2
 
 void TileMapLayerEditorTilesPlugin::_update_theme() {
 	source_sort_button->set_button_icon(tiles_bottom_panel->get_editor_theme_icon(SNAME("Sort")));
+	scene_tiles_sort_button->set_button_icon(tiles_bottom_panel->get_editor_theme_icon(SNAME("Sort")));
+	scene_tiles_grid_button->set_button_icon(tiles_bottom_panel->get_editor_theme_icon(SNAME("FileThumbnail")));
 	select_tool_button->set_button_icon(tiles_bottom_panel->get_editor_theme_icon(SNAME("ToolSelect")));
 	paint_tool_button->set_button_icon(tiles_bottom_panel->get_editor_theme_icon(SNAME("Edit")));
 	line_tool_button->set_button_icon(tiles_bottom_panel->get_editor_theme_icon(SNAME("Line")));
@@ -2445,6 +2552,11 @@ TileMapLayerEditorTilesPlugin::TileMapLayerEditorTilesPlugin() {
 	tile_atlas_view->add_control_over_alternative_tiles(alternative_tiles_control);
 
 	// Scenes collection source.
+	scene_tiles_container = memnew(VBoxContainer);
+	scene_tiles_container->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	scene_tiles_container->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	atlas_sources_split_container->add_child(scene_tiles_container);
+
 	scene_tiles_list = memnew(ItemList);
 	scene_tiles_list->set_auto_translate_mode(Node::AUTO_TRANSLATE_MODE_DISABLED);
 	scene_tiles_list->set_h_size_flags(Control::SIZE_EXPAND_FILL);
@@ -2452,8 +2564,42 @@ TileMapLayerEditorTilesPlugin::TileMapLayerEditorTilesPlugin() {
 	scene_tiles_list->set_select_mode(ItemList::SELECT_MULTI);
 	scene_tiles_list->connect("multi_selected", callable_mp(this, &TileMapLayerEditorTilesPlugin::_scenes_list_multi_selected));
 	scene_tiles_list->connect("empty_clicked", callable_mp(this, &TileMapLayerEditorTilesPlugin::_scenes_list_lmb_empty_clicked));
+	scene_tiles_list->connect(SceneStringName(gui_input), callable_mp(this, &TileMapLayerEditorTilesPlugin::_scenes_list_gui_input));
 	scene_tiles_list->set_texture_filter(CanvasItem::TEXTURE_FILTER_NEAREST);
-	atlas_sources_split_container->add_child(scene_tiles_list);
+	scene_tiles_container->add_child(scene_tiles_list);
+
+	HBoxContainer *scene_tiles_bottom_actions = memnew(HBoxContainer);
+	scene_tiles_bottom_actions->set_alignment(BoxContainer::ALIGNMENT_END);
+	scene_tiles_container->add_child(scene_tiles_bottom_actions);
+
+	scene_tiles_size_slider = memnew(HSlider);
+	scene_tiles_size_slider->set_min(32);
+	scene_tiles_size_slider->set_max(224);
+	scene_tiles_size_slider->set_step(16);
+	scene_tiles_size_slider->set_custom_minimum_size(Size2(64 * EDSCALE, 0));
+	scene_tiles_size_slider->set_custom_maximum_size(Size2(128 * EDSCALE, -1));
+	scene_tiles_size_slider->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+	scene_tiles_size_slider->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	scene_tiles_size_slider->set_tooltip_text(TTRC("Thumbnail size. Ctrl + mouse wheel over the list also changes it."));
+	scene_tiles_size_slider->set_accessibility_name(TTRC("Thumbnail Size"));
+	scene_tiles_size_slider->connect(SceneStringName(value_changed), callable_mp(this, &TileMapLayerEditorTilesPlugin::_scenes_list_thumbnail_size_changed));
+	scene_tiles_bottom_actions->add_child(scene_tiles_size_slider);
+
+	scene_tiles_sort_button = memnew(Button);
+	scene_tiles_sort_button->set_theme_type_variation(SceneStringName(FlatButton));
+	scene_tiles_sort_button->set_toggle_mode(true);
+	scene_tiles_sort_button->set_tooltip_text(TTRC("Sort scene tiles by name instead of by ID."));
+	scene_tiles_sort_button->set_accessibility_name(TTRC("Sort by Name"));
+	scene_tiles_sort_button->connect(SceneStringName(toggled), callable_mp(this, &TileMapLayerEditorTilesPlugin::_scenes_list_sort_toggled));
+	scene_tiles_bottom_actions->add_child(scene_tiles_sort_button);
+
+	scene_tiles_grid_button = memnew(Button);
+	scene_tiles_grid_button->set_theme_type_variation(SceneStringName(FlatButton));
+	scene_tiles_grid_button->set_toggle_mode(true);
+	scene_tiles_grid_button->set_tooltip_text(TTRC("View scene tiles as a grid of thumbnails."));
+	scene_tiles_grid_button->set_accessibility_name(TTRC("Grid View"));
+	scene_tiles_grid_button->connect(SceneStringName(toggled), callable_mp(this, &TileMapLayerEditorTilesPlugin::_scenes_list_grid_toggled));
+	scene_tiles_bottom_actions->add_child(scene_tiles_grid_button);
 
 	// Invalid source label.
 	invalid_source_label = memnew(Label);

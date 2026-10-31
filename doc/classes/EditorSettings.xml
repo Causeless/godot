@@ -300,6 +300,9 @@
 		<member name="docks/filesystem/textfile_extensions" type="String" setter="" getter="">
 			A comma separated list of file extensions to consider as editable text files in the FileSystem dock (by double-clicking on the files), e.g. [code]"txt,md,cfg,ini,log,json,yml,yaml,toml,xml"[/code].
 		</member>
+		<member name="docks/filesystem/scene_thumbnail_max_file_size_kb" type="int" setter="" getter="">
+			Scene files larger than this size (in kilobytes) are not instantiated to render their thumbnail. Such scenes fall back to the thumbnail captured from the editor viewport when they are saved, like 3D scenes do.
+		</member>
 		<member name="docks/filesystem/thumbnail_size" type="int" setter="" getter="">
 			The thumbnail size to use in the FileSystem dock (in pixels). See also [member filesystem/file_dialog/thumbnail_size].
 		</member>

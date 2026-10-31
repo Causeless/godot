@@ -66,7 +66,12 @@ class GodotPhysicsServer2D : public PhysicsServer2D {
 	static GodotPhysicsServer2D *godot_singleton;
 
 	friend class GodotCollisionObject2D;
+	// Collision objects queue themselves here when a shape changes and the next motion test or step drains it.
+	// Motion tests may run on several threads at once, so the list is only touched under its mutex.
+	Mutex pending_shape_update_mutex;
 	SelfList<GodotCollisionObject2D>::List pending_shape_update_list;
+	void _add_pending_shape_update(SelfList<GodotCollisionObject2D> *p_element);
+	void _remove_pending_shape_update(SelfList<GodotCollisionObject2D> *p_element);
 	void _update_shapes();
 
 	RID _shape_create(PS2DE::ShapeType p_shape);

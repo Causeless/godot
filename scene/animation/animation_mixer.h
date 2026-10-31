@@ -148,8 +148,15 @@ protected:
 		NodePath path;
 		int blend_idx = -1;
 		ObjectID object_id;
+		// The target when it is a node inside the tree, so blending can skip the ObjectDB lookup (a global spin lock) per track.
+		// Its tree_exiting signal clears the caches, so it never outlives the node. Null for other targets, which keep the lookup.
+		Object *object = nullptr;
 		real_t total_weight = 0.0;
 		uint64_t animation_instance_weight_applied_at = 0;
+
+		_FORCE_INLINE_ Object *get_object() const {
+			return object ? object : ObjectDB::get_instance(object_id);
+		}
 
 		TrackCache() = default;
 		TrackCache(const TrackCache &p_other) :
@@ -305,6 +312,7 @@ protected:
 
 	RootMotionCache root_motion_cache;
 	AHashMap<Animation::TrackCacheID, TrackCache *, HashHasher> track_cache;
+	LocalVector<ObjectID> cached_target_nodes; // Nodes whose tree_exiting signal is connected to _cached_target_node_exiting_tree().
 	AHashMap<Ref<Animation>, LocalVector<TrackCache *>> animation_track_num_to_track_cache;
 	HashSet<TrackCache *> playing_caches;
 	Vector<Node *> playing_audio_stream_players;
@@ -315,6 +323,9 @@ protected:
 	void _clear_playing_caches();
 	void _init_root_motion_cache();
 	bool _update_caches();
+	void _cache_track_target(TrackCache *p_track, Node *p_node);
+	void _release_cached_target_nodes();
+	void _cached_target_node_exiting_tree();
 	void _create_track_num_to_track_cache_for_animation(const Ref<Animation> &p_animation);
 
 	/* ---- Audio ---- */
@@ -372,7 +383,7 @@ protected:
 	void _blend_process(double p_delta, bool p_update_only = false);
 	void _blend_apply();
 	virtual void _blend_post_process();
-	void _call_object(ObjectID p_object_id, const StringName &p_method, const Vector<Variant> &p_params, bool p_deferred);
+	void _call_object(Object *p_object, const StringName &p_method, const Vector<Variant> &p_params, bool p_deferred);
 
 	/* ---- Capture feature ---- */
 	struct CaptureCache {

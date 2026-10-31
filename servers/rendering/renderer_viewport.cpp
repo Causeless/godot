@@ -423,6 +423,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
 		RendererCanvasRender::Light *directional_lights_with_shadow = nullptr;
 
 		if (p_viewport->sdf_active) {
+			GodotProfileZone("2D SDF occluders");
 			// Process SDF.
 
 			Rect2 sdf_rect = RSG::texture_storage->render_target_get_sdf_rect(p_viewport->render_target);
@@ -469,6 +470,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
 
 		RENDER_TIMESTAMP("Cull 2D Lights");
 		for (KeyValue<RID, Viewport::CanvasData> &E : p_viewport->canvas_map) {
+			GodotProfileZone("2D light cull");
 			RendererCanvasCull::Canvas *canvas = static_cast<RendererCanvasCull::Canvas *>(E.value.canvas);
 
 			Transform2D xf = _canvas_get_transform(p_viewport, canvas, &E.value, clip_rect.size);
@@ -546,6 +548,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
 		}
 
 		if (lights_with_shadow) {
+			GodotProfileZone("2D point light shadows");
 			//update shadows if any
 
 			RendererCanvasRender::LightOccluderInstance *occluders = nullptr;
@@ -589,6 +592,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
 		}
 
 		if (directional_lights_with_shadow) {
+			GodotProfileZone("2D directional light shadows");
 			//update shadows if any
 			RendererCanvasRender::Light *light = directional_lights_with_shadow;
 			while (light) {

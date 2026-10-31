@@ -104,8 +104,10 @@ private:
 		INTERSECTION_QUERY_MAX = 2048
 	};
 
-	GodotCollisionObject2D *intersection_query_results[INTERSECTION_QUERY_MAX];
-	int intersection_query_subindex_results[INTERSECTION_QUERY_MAX];
+	// Scratch for broadphase culls. Per thread rather than per space, so queries can run on several threads
+	// at once: the broadphase serializes its own culls, and nothing else in a query touches shared state.
+	static thread_local GodotCollisionObject2D *intersection_query_results[INTERSECTION_QUERY_MAX];
+	static thread_local int intersection_query_subindex_results[INTERSECTION_QUERY_MAX];
 
 	real_t body_linear_velocity_sleep_threshold = 0.0;
 	real_t body_angular_velocity_sleep_threshold = 0.0;

@@ -887,10 +887,12 @@ class AnimationTrackEditor : public VBoxContainer {
 
 	struct KeyClipboard {
 		int top_track;
+		ObjectID source_animation;
 
 		struct Key {
 			Animation::TrackType track_type;
 			int track;
+			NodePath path;
 			float time = 0;
 			float transition = 0;
 			Variant value;

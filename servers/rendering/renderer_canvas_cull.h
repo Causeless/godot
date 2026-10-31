@@ -83,8 +83,18 @@ public:
 
 		bool update_dependencies = false;
 
+		// Hierarchical culling: lets _cull_canvas_item() skip a whole subtree that is off-screen. See _update_subtree_rect().
+		Item *parent_item = nullptr; // Parent canvas item, or null when parented to a canvas (or nothing).
+		Rect2 subtree_rect; // Covers our own drawing and all our visible children's subtree rects, in our local space.
+		bool subtree_rect_has_content = false; // Whether anything in our subtree draws at all. If not, subtree_rect is meaningless.
+		bool subtree_rect_dirty = true; // Dirty items always have dirty ancestors, unless an ancestor in between is hidden.
+		bool subtree_unbounded = false; // Something in our subtree can't be bounded or must always be visited, so we're never culled as a whole.
+		bool has_volatile_rect_commands = false; // Has meshes, multimeshes or particles, whose rects change without a canvas item call.
+		SelfList<Item> volatile_rect_item; // On volatile_rect_items while our own rect can change without a canvas item call.
+
 		Item() :
-				update_item(this) {
+				update_item(this),
+				volatile_rect_item(this) {
 			children_order_dirty = true;
 			E = nullptr;
 			z_index = 0;
@@ -107,6 +117,28 @@ public:
 
 	void _item_queue_update(Item *p_item, bool p_update_dependencies);
 	SelfList<Item>::List _item_update_list;
+
+	enum HierarchicalCullingMode {
+		HIERARCHICAL_CULLING_DISABLED,
+		HIERARCHICAL_CULLING_ENABLED,
+		HIERARCHICAL_CULLING_ENABLED_AND_VALIDATE, // Also recomputes every subtree rect from scratch each frame and reports stale ones. Slow.
+	};
+
+	HierarchicalCullingMode hierarchical_culling_mode = HIERARCHICAL_CULLING_ENABLED;
+	SelfList<Item>::List volatile_rect_items; // Items whose own rect can change without a canvas item call, re-dirtied every render.
+
+	// Per render_canvas() call, for profiling.
+	uint32_t cull_items_visited = 0;
+	uint32_t cull_subtrees_culled = 0;
+	uint32_t subtree_rects_updated = 0;
+	uint32_t subtree_rect_validation_errors = 0;
+
+	void _mark_subtree_rect_dirty(Item *p_item);
+	void _update_item_volatile_rect(Item *p_item);
+	bool _get_item_own_rect(Item *p_item, Rect2 &r_rect) const;
+	bool _is_item_unbounded(const Item *p_item) const;
+	void _update_subtree_rect(Item *p_item);
+	bool _validate_subtree_rect(Item *p_item, Rect2 &r_rect, bool &r_unbounded);
 
 	struct ItemIndexSort {
 		_FORCE_INLINE_ bool operator()(const Item *p_left, const Item *p_right) const {

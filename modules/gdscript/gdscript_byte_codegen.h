@@ -116,6 +116,9 @@ class GDScriptByteCodeGenerator : public GDScriptCodeGenerator {
 	RBMap<const MethodBind *, int> method_bind_map;
 	RBMap<GDScriptFunction *, int> lambdas_map;
 
+	// Number of `OPCODE_CALL*` sites emitted so far; each gets its own `GDScriptFunction::CallSiteCache`.
+	int call_cache_count = 0;
+
 #ifdef DEBUG_ENABLED
 	// Keep method and property names for pointer and validated operations.
 	// Used when disassembling the bytecode.

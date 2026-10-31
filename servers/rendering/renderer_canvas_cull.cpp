@@ -34,6 +34,7 @@
 #include "core/config/project_settings.h"
 #include "core/math/geometry_2d.h"
 #include "core/math/transform_interpolator.h"
+#include "core/profiling/profiling.h"
 #include "servers/rendering/renderer_viewport.h"
 #include "servers/rendering/rendering_server_default.h"
 #include "servers/rendering/rendering_server_globals.h"
@@ -79,8 +80,11 @@ void RendererCanvasCull::_render_canvas_item_tree(RID p_to_render_target, Canvas
 	memset(z_list, 0, z_range * sizeof(RendererCanvasRender::Item *));
 	memset(z_last_list, 0, z_range * sizeof(RendererCanvasRender::Item *));
 
-	for (int i = 0; i < p_child_item_count; i++) {
-		_cull_canvas_item(p_child_items[i].item, p_transform, p_clip_rect, Color(1, 1, 1, 1), 0, z_list, z_last_list, nullptr, nullptr, false, p_canvas_cull_mask, Point2(), 1, nullptr);
+	{
+		GodotProfileZone("cull canvas items");
+		for (int i = 0; i < p_child_item_count; i++) {
+			_cull_canvas_item(p_child_items[i].item, p_transform, p_clip_rect, Color(1, 1, 1, 1), 0, z_list, z_last_list, nullptr, nullptr, false, p_canvas_cull_mask, Point2(), 1, nullptr);
+		}
 	}
 
 	RendererCanvasRender::Item *list = nullptr;
@@ -101,6 +105,7 @@ void RendererCanvasCull::_render_canvas_item_tree(RID p_to_render_target, Canvas
 
 	RENDER_TIMESTAMP("Render CanvasItems");
 
+	GodotProfileZone("canvas_render_items");
 	bool sdf_flag;
 	RSG::canvas_render->canvas_render_items(p_to_render_target, list, p_modulate, p_lights, p_directional_lights, p_transform, p_default_filter, p_default_repeat, p_snap_2d_vertices_to_pixel, sdf_flag, r_render_info);
 	if (sdf_flag) {
@@ -187,6 +192,127 @@ void RendererCanvasCull::_mark_ysort_dirty(RendererCanvasCull::Item *ysort_owner
 		ysort_owner->ysort_children_count = -1;
 		ysort_owner = canvas_item_owner.owns(ysort_owner->parent) ? canvas_item_owner.get_or_null(ysort_owner->parent) : nullptr;
 	} while (ysort_owner && ysort_owner->sort_y);
+}
+
+void RendererCanvasCull::_mark_subtree_rect_dirty(Item *p_item) {
+	// Our ancestors' subtree rects include ours. Stops at the first already dirty item, as its ancestors are dirty already.
+	Item *item = p_item;
+	while (item && !item->subtree_rect_dirty) {
+		item->subtree_rect_dirty = true;
+		item = item->parent_item;
+	}
+}
+
+void RendererCanvasCull::_update_item_volatile_rect(Item *p_item) {
+	// Skeletons and update-when-visible make Item::get_rect() recompute on every call, and mesh/multimesh/particle AABBs change on their own.
+	bool is_volatile = p_item->has_volatile_rect_commands || p_item->skeleton.is_valid() || p_item->update_when_visible;
+	if (is_volatile && !p_item->volatile_rect_item.in_list()) {
+		volatile_rect_items.add(&p_item->volatile_rect_item);
+	} else if (!is_volatile && p_item->volatile_rect_item.in_list()) {
+		volatile_rect_items.remove(&p_item->volatile_rect_item);
+	}
+}
+
+bool RendererCanvasCull::_get_item_own_rect(Item *p_item, Rect2 &r_rect) const {
+	// Covers the rect _cull_canvas_item() tests for this item, including its notifier area merge. Returns false if the item draws nothing.
+	if (p_item->commands == nullptr && !p_item->visibility_notifier) {
+		return false;
+	}
+
+	r_rect = p_item->get_rect().abs(); // Draw commands may use negative sizes, which Rect2::merge() doesn't handle.
+	if (p_item->visibility_notifier && p_item->visibility_notifier->area.size != Vector2()) {
+		r_rect = r_rect.merge(p_item->visibility_notifier->area.abs());
+	}
+
+	return true;
+}
+
+bool RendererCanvasCull::_is_item_unbounded(const Item *p_item) const {
+	// Identity transform items draw relative to the camera rather than to us, canvas groups fit their rect to their children while culling,
+	// repeat sources draw copies of their subtree elsewhere, and back buffer copies and viewport renders are attached even when off-screen.
+	return p_item->use_identity_transform || p_item->canvas_group != nullptr || p_item->repeat_source || p_item->copy_back_buffer != nullptr || p_item->vp_render != nullptr;
+}
+
+void RendererCanvasCull::_update_subtree_rect(Item *p_item) {
+	if (!p_item->subtree_rect_dirty) {
+		return;
+	}
+
+	p_item->subtree_rect_dirty = false;
+	subtree_rects_updated++;
+
+	Rect2 subtree_rect;
+	bool has_content = _get_item_own_rect(p_item, subtree_rect);
+	bool is_unbounded = _is_item_unbounded(p_item);
+
+	// Every visible child is updated, even once we know we're unbounded, so no dirty child is left behind a clean parent.
+	for (Item *child : p_item->child_items) {
+		if (!child->visible) {
+			continue; // Hidden subtrees aren't drawn, and showing them dirties us again.
+		}
+
+		_update_subtree_rect(child);
+		is_unbounded = is_unbounded || child->subtree_unbounded;
+		if (!child->subtree_rect_has_content) {
+			continue;
+		}
+
+		Rect2 child_rect = child->xform_curr.xform(child->subtree_rect);
+		if (_interpolation_data.interpolation_enabled && child->interpolated && child->on_interpolate_transform_list) {
+			child_rect = child_rect.merge(child->xform_prev.xform(child->subtree_rect)); // Culling uses a transform in between the two.
+		}
+
+		subtree_rect = has_content ? subtree_rect.merge(child_rect) : child_rect;
+		has_content = true;
+	}
+
+	p_item->subtree_rect = subtree_rect;
+	p_item->subtree_rect_has_content = has_content;
+	p_item->subtree_unbounded = is_unbounded;
+}
+
+bool RendererCanvasCull::_validate_subtree_rect(Item *p_item, Rect2 &r_rect, bool &r_unbounded) {
+	// Same as _update_subtree_rect(), but from scratch and without touching the cache, reporting cached rects culling would wrongly trust.
+	Rect2 subtree_rect;
+	bool has_content = _get_item_own_rect(p_item, subtree_rect);
+	bool is_unbounded = _is_item_unbounded(p_item);
+
+	for (Item *child : p_item->child_items) {
+		if (!child->visible) {
+			continue;
+		}
+
+		Rect2 child_subtree_rect;
+		bool is_child_unbounded = false;
+		bool child_has_content = _validate_subtree_rect(child, child_subtree_rect, is_child_unbounded);
+		is_unbounded = is_unbounded || is_child_unbounded;
+		if (!child_has_content) {
+			continue;
+		}
+
+		Rect2 child_rect = child->xform_curr.xform(child_subtree_rect);
+		if (_interpolation_data.interpolation_enabled && child->interpolated && child->on_interpolate_transform_list) {
+			child_rect = child_rect.merge(child->xform_prev.xform(child_subtree_rect));
+		}
+
+		subtree_rect = has_content ? subtree_rect.merge(child_rect) : child_rect;
+		has_content = true;
+	}
+
+	// _cull_canvas_item() only trusts clean, bounded caches.
+	bool is_cache_trusted = !p_item->subtree_rect_dirty && !p_item->subtree_unbounded;
+	bool is_stale = is_cache_trusted && (is_unbounded || (has_content && (!p_item->subtree_rect_has_content || !p_item->subtree_rect.grow(0.01).encloses(subtree_rect))));
+	if (is_stale) {
+		subtree_rect_validation_errors++;
+		if (subtree_rect_validation_errors <= 10) { // Per frame, so a systematic error doesn't flood the log.
+			ERR_PRINT(vformat("Hierarchical canvas culling: stale subtree rect on canvas item %d. Cached %s (has content: %s), actual %s (unbounded: %s).",
+					(int64_t)p_item->self.get_id(), p_item->subtree_rect, p_item->subtree_rect_has_content, subtree_rect, is_unbounded));
+		}
+	}
+
+	r_rect = subtree_rect;
+	r_unbounded = is_unbounded;
+	return has_content;
 }
 
 void RendererCanvasCull::_attach_canvas_item_for_draw(RendererCanvasCull::Item *ci, RendererCanvasCull::Item *p_canvas_clip, RendererCanvasRender::Item **r_z_list, RendererCanvasRender::Item **r_z_last_list, const Transform2D &p_transform, const Rect2 &p_clip_rect, Rect2 p_global_rect, const Color &p_modulate, int p_z, RendererCanvasCull::Item *p_material_owner, bool p_use_canvas_group, RendererCanvasRender::Item *r_canvas_group_from) {
@@ -303,6 +429,7 @@ void RendererCanvasCull::_attach_canvas_item_for_draw(RendererCanvasCull::Item *
 
 void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2D &p_parent_xform, const Rect2 &p_clip_rect, const Color &p_modulate, int p_z, RendererCanvasRender::Item **r_z_list, RendererCanvasRender::Item **r_z_last_list, Item *p_canvas_clip, Item *p_material_owner, bool p_is_already_y_sorted, uint32_t p_canvas_cull_mask, const Point2 &p_repeat_size, int p_repeat_times, RendererCanvasRender::Item *p_repeat_source_item) {
 	Item *ci = p_canvas_item;
+	cull_items_visited++;
 
 	if (!ci->visible) {
 		return;
@@ -407,6 +534,22 @@ void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2
 	}
 	global_rect.position += p_clip_rect.position;
 
+	// Hierarchical culling: skip our whole subtree if none of it reaches the screen. Not inside repeats, which draw copies of it elsewhere.
+	bool is_in_repeat = repeat_source_item && (repeat_size.x || repeat_size.y);
+	if (hierarchical_culling_mode != HIERARCHICAL_CULLING_DISABLED && !ci->subtree_rect_dirty && !ci->subtree_unbounded && !is_in_repeat) {
+		if (!ci->subtree_rect_has_content) {
+			cull_subtrees_culled++;
+			return;
+		}
+
+		Rect2 subtree_global_rect = final_xform.xform(ci->subtree_rect).grow(2.0); // Grown to cover pixel snapping.
+		subtree_global_rect.position += p_clip_rect.position;
+		if (!p_clip_rect.intersects(subtree_global_rect, true)) {
+			cull_subtrees_culled++;
+			return;
+		}
+	}
+
 	int child_item_count = ci->child_items.size();
 	Item **child_items = ci->child_items.ptrw();
 
@@ -493,6 +636,7 @@ void RendererCanvasCull::_cull_canvas_item(Item *p_canvas_item, const Transform2
 }
 
 void RendererCanvasCull::render_canvas(RID p_render_target, Canvas *p_canvas, const Transform2D &p_transform, RendererCanvasRender::Light *p_lights, RendererCanvasRender::Light *p_directional_lights, const Rect2 &p_clip_rect, RSE::CanvasItemTextureFilter p_default_filter, RSE::CanvasItemTextureRepeat p_default_repeat, bool p_snap_2d_transforms_to_pixel, bool p_snap_2d_vertices_to_pixel, uint32_t canvas_cull_mask, RenderingServerTypes::RenderInfo *r_render_info) {
+	GodotProfileZone("render_canvas");
 	sdf_used = false;
 	snapping_2d_transforms_to_pixel = p_snap_2d_transforms_to_pixel;
 
@@ -503,6 +647,26 @@ void RendererCanvasCull::render_canvas(RID p_render_target, Canvas *p_canvas, co
 
 	int l = p_canvas->child_items.size();
 	Canvas::ChildItem *ci = p_canvas->child_items.ptrw();
+
+	if (hierarchical_culling_mode != HIERARCHICAL_CULLING_DISABLED) {
+		GodotProfileZone("update canvas subtree rects");
+		for (int i = 0; i < l; i++) {
+			if (ci[i].item->visible) {
+				_update_subtree_rect(ci[i].item);
+			}
+		}
+
+		if (hierarchical_culling_mode == HIERARCHICAL_CULLING_ENABLED_AND_VALIDATE) {
+			GodotProfileZone("validate canvas subtree rects");
+			for (int i = 0; i < l; i++) {
+				if (ci[i].item->visible) {
+					Rect2 subtree_rect;
+					bool is_unbounded = false;
+					_validate_subtree_rect(ci[i].item, subtree_rect, is_unbounded);
+				}
+			}
+		}
+	}
 
 	_render_canvas_item_tree(p_render_target, ci, l, p_transform, p_clip_rect, p_canvas->modulate, p_lights, p_directional_lights, p_default_filter, p_default_repeat, p_snap_2d_vertices_to_pixel, canvas_cull_mask, r_render_info);
 }
@@ -532,6 +696,7 @@ void RendererCanvasCull::canvas_set_item_mirroring(RID p_canvas, RID p_item, con
 	canvas_item->repeat_source_item = is_repeat_source ? canvas_item : nullptr;
 	canvas_item->repeat_size = p_mirroring;
 	canvas_item->repeat_times = 1;
+	_mark_subtree_rect_dirty(canvas_item);
 }
 
 void RendererCanvasCull::canvas_set_item_repeat(RID p_item, const Point2 &p_repeat_size, int p_repeat_times) {
@@ -544,6 +709,7 @@ void RendererCanvasCull::canvas_set_item_repeat(RID p_item, const Point2 &p_repe
 	canvas_item->repeat_source_item = is_repeat_source ? canvas_item : nullptr;
 	canvas_item->repeat_size = p_repeat_size;
 	canvas_item->repeat_times = p_repeat_times;
+	_mark_subtree_rect_dirty(canvas_item);
 }
 
 void RendererCanvasCull::canvas_set_modulate(RID p_canvas, const Color &p_color) {
@@ -577,6 +743,9 @@ void RendererCanvasCull::canvas_item_set_parent(RID p_item, RID p_parent) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
 
+	_mark_subtree_rect_dirty(canvas_item->parent_item);
+	canvas_item->parent_item = nullptr;
+
 	if (canvas_item->parent.is_valid()) {
 		if (canvas_owner.owns(canvas_item->parent)) {
 			Canvas *canvas = canvas_owner.get_or_null(canvas_item->parent);
@@ -604,6 +773,8 @@ void RendererCanvasCull::canvas_item_set_parent(RID p_item, RID p_parent) {
 			Item *item_owner = canvas_item_owner.get_or_null(p_parent);
 			item_owner->child_items.push_back(canvas_item);
 			item_owner->children_order_dirty = true;
+			canvas_item->parent_item = item_owner;
+			_mark_subtree_rect_dirty(item_owner);
 
 			if (item_owner->sort_y) {
 				_mark_ysort_dirty(item_owner);
@@ -624,6 +795,7 @@ void RendererCanvasCull::canvas_item_set_visible(RID p_item, bool p_visible) {
 	canvas_item->visible = p_visible;
 
 	_mark_ysort_dirty(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item->parent_item);
 }
 
 void RendererCanvasCull::canvas_item_set_light_mask(RID p_item, int p_mask) {
@@ -647,6 +819,7 @@ void RendererCanvasCull::canvas_item_set_transform(RID p_item, const Transform2D
 	}
 
 	canvas_item->xform_curr = p_transform;
+	_mark_subtree_rect_dirty(canvas_item->parent_item); // Our own subtree rect is in our local space, so only our parent's changes.
 }
 
 void RendererCanvasCull::canvas_item_set_visibility_layer(RID p_item, uint32_t p_visibility_layer) {
@@ -684,6 +857,7 @@ void RendererCanvasCull::canvas_item_set_custom_rect(RID p_item, bool p_custom_r
 
 	canvas_item->custom_rect = p_custom_rect;
 	canvas_item->rect = p_rect;
+	_mark_subtree_rect_dirty(canvas_item);
 }
 
 void RendererCanvasCull::canvas_item_set_modulate(RID p_item, const Color &p_color) {
@@ -712,6 +886,7 @@ void RendererCanvasCull::canvas_item_set_use_identity_transform(RID p_item, bool
 	ERR_FAIL_NULL(canvas_item);
 
 	canvas_item->use_identity_transform = p_enable;
+	_mark_subtree_rect_dirty(canvas_item);
 }
 
 void RendererCanvasCull::canvas_item_set_update_when_visible(RID p_item, bool p_update) {
@@ -719,6 +894,8 @@ void RendererCanvasCull::canvas_item_set_update_when_visible(RID p_item, bool p_
 	ERR_FAIL_NULL(canvas_item);
 
 	canvas_item->update_when_visible = p_update;
+	_update_item_volatile_rect(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 }
 
 // Compensate the width added by the antialiasing feather by reducing the base line width.
@@ -747,6 +924,7 @@ float RendererCanvasCull::canvas_item_get_compensated_antialiasing_width(float p
 void RendererCanvasCull::canvas_item_add_line(RID p_item, const Point2 &p_from, const Point2 &p_to, const Color &p_color, float p_width, bool p_antialiased) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	Item::CommandPrimitive *line = canvas_item->alloc_command<Item::CommandPrimitive>();
 	ERR_FAIL_NULL(line);
@@ -981,6 +1159,7 @@ void RendererCanvasCull::canvas_item_add_polyline(RID p_item, const Vector<Point
 	ERR_FAIL_COND(p_points.size() < 2);
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	Color color = Color(1, 1, 1, 1);
 
@@ -1258,6 +1437,7 @@ void RendererCanvasCull::canvas_item_add_multiline(RID p_item, const Vector<Poin
 		}
 		Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 		ERR_FAIL_NULL(canvas_item);
+		_mark_subtree_rect_dirty(canvas_item); // The wide branch goes through canvas_item_add_line(), which does this itself.
 
 		Vector<Color> colors;
 		if (p_colors.size() == 1) {
@@ -1300,6 +1480,7 @@ void RendererCanvasCull::canvas_item_add_multiline(RID p_item, const Vector<Poin
 void RendererCanvasCull::canvas_item_add_rect(RID p_item, const Rect2 &p_rect, const Color &p_color, bool p_antialiased) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	// Adjust the rectangle size to account for the antialiasing width.
 	const Rect2 &rect_adjusted = p_antialiased ? p_rect.grow(-FEATHER_SIZE * 0.25f) : p_rect;
@@ -1467,6 +1648,7 @@ void RendererCanvasCull::canvas_item_add_rect(RID p_item, const Rect2 &p_rect, c
 void RendererCanvasCull::canvas_item_add_ellipse(RID p_item, const Point2 &p_pos, float p_major, float p_minor, const Color &p_color, bool p_antialiased) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	static const int ellipse_segments = 64;
 
@@ -1570,6 +1752,7 @@ void RendererCanvasCull::canvas_item_add_circle(RID p_item, const Point2 &p_pos,
 void RendererCanvasCull::canvas_item_add_texture_rect(RID p_item, const Rect2 &p_rect, RID p_texture, bool p_tile, const Color &p_modulate, bool p_transpose) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	Item::CommandRect *rect = canvas_item->alloc_command<Item::CommandRect>();
 	ERR_FAIL_NULL(rect);
@@ -1601,6 +1784,7 @@ void RendererCanvasCull::canvas_item_add_texture_rect(RID p_item, const Rect2 &p
 void RendererCanvasCull::canvas_item_add_msdf_texture_rect_region(RID p_item, const Rect2 &p_rect, RID p_texture, const Rect2 &p_src_rect, const Color &p_modulate, int p_outline_size, float p_px_range, float p_scale) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	Item::CommandRect *rect = canvas_item->alloc_command<Item::CommandRect>();
 	ERR_FAIL_NULL(rect);
@@ -1635,6 +1819,7 @@ void RendererCanvasCull::canvas_item_add_msdf_texture_rect_region(RID p_item, co
 void RendererCanvasCull::canvas_item_add_lcd_texture_rect_region(RID p_item, const Rect2 &p_rect, RID p_texture, const Rect2 &p_src_rect, const Color &p_modulate) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	Item::CommandRect *rect = canvas_item->alloc_command<Item::CommandRect>();
 	ERR_FAIL_NULL(rect);
@@ -1667,6 +1852,7 @@ void RendererCanvasCull::canvas_item_add_lcd_texture_rect_region(RID p_item, con
 void RendererCanvasCull::canvas_item_add_texture_rect_region(RID p_item, const Rect2 &p_rect, RID p_texture, const Rect2 &p_src_rect, const Color &p_modulate, bool p_transpose, bool p_clip_uv) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	Item::CommandRect *rect = canvas_item->alloc_command<Item::CommandRect>();
 	ERR_FAIL_NULL(rect);
@@ -1708,6 +1894,7 @@ void RendererCanvasCull::canvas_item_add_texture_rect_region(RID p_item, const R
 void RendererCanvasCull::canvas_item_add_nine_patch(RID p_item, const Rect2 &p_rect, const Rect2 &p_source, RID p_texture, const Vector2 &p_topleft, const Vector2 &p_bottomright, RSE::NinePatchAxisMode p_x_axis_mode, RSE::NinePatchAxisMode p_y_axis_mode, bool p_draw_center, const Color &p_modulate) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	Item::CommandNinePatch *style = canvas_item->alloc_command<Item::CommandNinePatch>();
 	ERR_FAIL_NULL(style);
@@ -1732,6 +1919,7 @@ void RendererCanvasCull::canvas_item_add_primitive(RID p_item, const Vector<Poin
 
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	Item::CommandPrimitive *prim = canvas_item->alloc_command<Item::CommandPrimitive>();
 	ERR_FAIL_NULL(prim);
@@ -1758,6 +1946,7 @@ void RendererCanvasCull::canvas_item_add_primitive(RID p_item, const Vector<Poin
 void RendererCanvasCull::canvas_item_add_polygon(RID p_item, const Vector<Point2> &p_points, const Vector<Color> &p_colors, const Vector<Point2> &p_uvs, RID p_texture) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 #ifdef DEBUG_ENABLED
 	int pointcount = p_points.size();
 	ERR_FAIL_COND(pointcount < 3);
@@ -1779,6 +1968,7 @@ void RendererCanvasCull::canvas_item_add_polygon(RID p_item, const Vector<Point2
 void RendererCanvasCull::canvas_item_add_triangle_array(RID p_item, const Vector<int> &p_indices, const Vector<Point2> &p_points, const Vector<Color> &p_colors, const Vector<Point2> &p_uvs, const Vector<int> &p_bones, const Vector<float> &p_weights, RID p_texture, int p_count) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	int vertex_count = p_points.size();
 	ERR_FAIL_COND(vertex_count == 0);
@@ -1800,6 +1990,7 @@ void RendererCanvasCull::canvas_item_add_triangle_array(RID p_item, const Vector
 void RendererCanvasCull::canvas_item_add_set_transform(RID p_item, const Transform2D &p_transform) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	Item::CommandTransform *tr = canvas_item->alloc_command<Item::CommandTransform>();
 	ERR_FAIL_NULL(tr);
@@ -1809,6 +2000,7 @@ void RendererCanvasCull::canvas_item_add_set_transform(RID p_item, const Transfo
 void RendererCanvasCull::canvas_item_add_mesh(RID p_item, const RID &p_mesh, const Transform2D &p_transform, const Color &p_modulate, RID p_texture) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 	ERR_FAIL_COND(!p_mesh.is_valid());
 
 	Item::CommandMesh *m = canvas_item->alloc_command<Item::CommandMesh>();
@@ -1823,11 +2015,15 @@ void RendererCanvasCull::canvas_item_add_mesh(RID p_item, const RID &p_mesh, con
 
 	m->transform = p_transform;
 	m->modulate = p_modulate;
+
+	canvas_item->has_volatile_rect_commands = true;
+	_update_item_volatile_rect(canvas_item);
 }
 
 void RendererCanvasCull::canvas_item_add_particles(RID p_item, RID p_particles, RID p_texture) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	Item::CommandParticles *part = canvas_item->alloc_command<Item::CommandParticles>();
 	ERR_FAIL_NULL(part);
@@ -1837,22 +2033,30 @@ void RendererCanvasCull::canvas_item_add_particles(RID p_item, RID p_particles, 
 
 	//take the chance and request processing for them, at least once until they become visible again
 	RSG::particles_storage->particles_request_process(p_particles);
+
+	canvas_item->has_volatile_rect_commands = true;
+	_update_item_volatile_rect(canvas_item);
 }
 
 void RendererCanvasCull::canvas_item_add_multimesh(RID p_item, RID p_mesh, RID p_texture) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	Item::CommandMultiMesh *mm = canvas_item->alloc_command<Item::CommandMultiMesh>();
 	ERR_FAIL_NULL(mm);
 	mm->multimesh = p_mesh;
 
 	mm->texture = p_texture;
+
+	canvas_item->has_volatile_rect_commands = true;
+	_update_item_volatile_rect(canvas_item);
 }
 
 void RendererCanvasCull::canvas_item_add_clip_ignore(RID p_item, bool p_ignore) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	Item::CommandClipIgnore *ci = canvas_item->alloc_command<Item::CommandClipIgnore>();
 	ERR_FAIL_NULL(ci);
@@ -1862,6 +2066,7 @@ void RendererCanvasCull::canvas_item_add_clip_ignore(RID p_item, bool p_ignore) 
 void RendererCanvasCull::canvas_item_add_animation_slice(RID p_item, double p_animation_length, double p_slice_begin, double p_slice_end, double p_offset) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	Item::CommandAnimationSlice *as = canvas_item->alloc_command<Item::CommandAnimationSlice>();
 	ERR_FAIL_NULL(as);
@@ -1903,6 +2108,8 @@ void RendererCanvasCull::canvas_item_attach_skeleton(RID p_item, RID p_skeleton)
 		return;
 	}
 	canvas_item->skeleton = p_skeleton;
+	_update_item_volatile_rect(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 	Item::Command *c = canvas_item->commands;
 
@@ -1940,6 +2147,8 @@ void RendererCanvasCull::canvas_item_set_copy_to_backbuffer(RID p_item, bool p_e
 		canvas_item->copy_back_buffer->rect = p_rect;
 		canvas_item->copy_back_buffer->full = p_rect == Rect2();
 	}
+
+	_mark_subtree_rect_dirty(canvas_item);
 }
 
 void RendererCanvasCull::canvas_item_clear(RID p_item) {
@@ -1947,6 +2156,9 @@ void RendererCanvasCull::canvas_item_clear(RID p_item) {
 	ERR_FAIL_NULL(canvas_item);
 
 	canvas_item->clear();
+	canvas_item->has_volatile_rect_commands = false;
+	_update_item_volatile_rect(canvas_item);
+	_mark_subtree_rect_dirty(canvas_item);
 
 #ifdef DEBUG_ENABLED
 	if (debug_redraw) {
@@ -2038,6 +2250,8 @@ void RendererCanvasCull::canvas_item_set_visibility_notifier(RID p_item, bool p_
 			canvas_item->visibility_notifier = nullptr;
 		}
 	}
+
+	_mark_subtree_rect_dirty(canvas_item);
 }
 
 void RendererCanvasCull::canvas_item_set_debug_redraw(bool p_enabled) {
@@ -2053,12 +2267,14 @@ void RendererCanvasCull::canvas_item_set_interpolated(RID p_item, bool p_interpo
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
 	canvas_item->interpolated = p_interpolated;
+	_mark_subtree_rect_dirty(canvas_item->parent_item);
 }
 
 void RendererCanvasCull::canvas_item_reset_physics_interpolation(RID p_item) {
 	Item *canvas_item = canvas_item_owner.get_or_null(p_item);
 	ERR_FAIL_NULL(canvas_item);
 	canvas_item->xform_prev = canvas_item->xform_curr;
+	_mark_subtree_rect_dirty(canvas_item->parent_item);
 }
 
 // Useful especially for origin shifting.
@@ -2067,6 +2283,7 @@ void RendererCanvasCull::canvas_item_transform_physics_interpolation(RID p_item,
 	ERR_FAIL_NULL(canvas_item);
 	canvas_item->xform_prev = p_transform * canvas_item->xform_prev;
 	canvas_item->xform_curr = p_transform * canvas_item->xform_curr;
+	_mark_subtree_rect_dirty(canvas_item->parent_item);
 }
 
 void RendererCanvasCull::canvas_item_set_canvas_group_mode(RID p_item, RSE::CanvasGroupMode p_mode, float p_clear_margin, bool p_fit_empty, float p_fit_margin, bool p_blur_mipmaps) {
@@ -2088,6 +2305,8 @@ void RendererCanvasCull::canvas_item_set_canvas_group_mode(RID p_item, RSE::Canv
 		canvas_item->canvas_group->blur_mipmaps = p_blur_mipmaps;
 		canvas_item->canvas_group->clear_margin = p_clear_margin;
 	}
+
+	_mark_subtree_rect_dirty(canvas_item);
 }
 
 RID RendererCanvasCull::canvas_light_allocate() {
@@ -2602,6 +2821,23 @@ void RendererCanvasCull::_update_dirty_item(Item *p_item) {
 
 void RendererCanvasCull::update() {
 	update_dirty_items();
+
+#ifdef GODOT_USE_TRACY
+	// Last frame's totals over all canvases rendered.
+	TracyPlot("Canvas items visited", (int64_t)cull_items_visited);
+	TracyPlot("Canvas subtrees culled", (int64_t)cull_subtrees_culled);
+	TracyPlot("Canvas subtree rects updated", (int64_t)subtree_rects_updated);
+#endif
+	cull_items_visited = 0;
+	cull_subtrees_culled = 0;
+	subtree_rects_updated = 0;
+	subtree_rect_validation_errors = 0;
+
+	if (hierarchical_culling_mode != HIERARCHICAL_CULLING_DISABLED) {
+		for (SelfList<Item> *E = volatile_rect_items.first(); E; E = E->next()) {
+			_mark_subtree_rect_dirty(E->self());
+		}
+	}
 }
 
 bool RendererCanvasCull::free(RID p_rid) {
@@ -2638,6 +2874,7 @@ bool RendererCanvasCull::free(RID p_rid) {
 		Item *canvas_item = canvas_item_owner.get_or_null(p_rid);
 		ERR_FAIL_NULL_V(canvas_item, true);
 		_interpolation_data.notify_free_canvas_item(p_rid, *canvas_item);
+		_mark_subtree_rect_dirty(canvas_item->parent_item);
 
 		if (canvas_item->parent.is_valid()) {
 			if (canvas_owner.owns(canvas_item->parent)) {
@@ -2655,6 +2892,7 @@ bool RendererCanvasCull::free(RID p_rid) {
 
 		for (int i = 0; i < canvas_item->child_items.size(); i++) {
 			canvas_item->child_items[i]->parent = RID();
+			canvas_item->child_items[i]->parent_item = nullptr;
 		}
 
 		if (canvas_item->visibility_notifier != nullptr) {
@@ -2780,6 +3018,16 @@ void RendererCanvasCull::update_interpolation_tick(bool p_process) {
 	SWAP(_interpolation_data.m_list_curr, _interpolation_data.m_list_prev); \
 	_interpolation_data.m_list_curr->clear();
 
+	// Ticking changes the previous transforms (and which items interpolate) that our parents' subtree rects include.
+	for (const LocalVector<RID> *list : { _interpolation_data.canvas_item_transform_update_list_prev, _interpolation_data.canvas_item_transform_update_list_curr }) {
+		for (const RID &rid : *list) {
+			Item *item = canvas_item_owner.get_or_null(rid);
+			if (item) {
+				_mark_subtree_rect_dirty(item->parent_item);
+			}
+		}
+	}
+
 	GODOT_UPDATE_INTERPOLATION_TICK(canvas_item_transform_update_list_prev, canvas_item_transform_update_list_curr, Item, canvas_item_owner);
 	GODOT_UPDATE_INTERPOLATION_TICK(canvas_light_transform_update_list_prev, canvas_light_transform_update_list_curr, RendererCanvasRender::Light, canvas_light_owner);
 	GODOT_UPDATE_INTERPOLATION_TICK(canvas_light_occluder_transform_update_list_prev, canvas_light_occluder_transform_update_list_curr, RendererCanvasRender::LightOccluderInstance, canvas_light_occluder_owner);
@@ -2833,6 +3081,7 @@ RendererCanvasCull::RendererCanvasCull() {
 
 	debug_redraw_time = GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "debug/canvas_items/debug_redraw_time", PROPERTY_HINT_RANGE, "0.1,2,0.001,or_greater"), 1.0);
 	debug_redraw_color = GLOBAL_DEF(PropertyInfo(Variant::COLOR, "debug/canvas_items/debug_redraw_color"), Color(1.0, 0.2, 0.2, 0.5));
+	hierarchical_culling_mode = (HierarchicalCullingMode)(int)GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/2d/culling/hierarchical_culling", PROPERTY_HINT_ENUM, "Disabled,Enabled,Enabled and Validate"), HIERARCHICAL_CULLING_ENABLED);
 }
 
 RendererCanvasCull::~RendererCanvasCull() {
