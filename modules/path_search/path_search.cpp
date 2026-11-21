@@ -146,6 +146,7 @@ Dictionary PathSearch::find_path(const Dictionary &p_graph, int p_start_node, in
 	const PackedInt32Array connection_key_array = p_graph.get("connection_key", PackedInt32Array());
 	const PackedInt32Array connection_start_node_array = p_graph.get("connection_start_node", PackedInt32Array());
 	const PackedInt32Array connection_end_node_array = p_graph.get("connection_end_node", PackedInt32Array());
+	const PackedByteArray connection_group_array = p_graph.get("connection_group", PackedByteArray());
 	const PackedByteArray node_active_array = p_graph.get("node_active", PackedByteArray());
 	const PackedByteArray node_is_climb_array = p_graph.get("node_is_climb", PackedByteArray());
 	const PackedInt32Array node_connection_begin_array = p_graph.get("node_connection_begin", PackedInt32Array());
@@ -154,6 +155,7 @@ Dictionary PathSearch::find_path(const Dictionary &p_graph, int p_start_node, in
 	const int connection_count = connection_flags_array.size();
 	const int node_count = node_active_array.size();
 	ERR_FAIL_COND_V_MSG(connection_position_array.size() != connection_count || connection_landing_array.size() != connection_count || connection_runup_x_array.size() != connection_count || connection_runup_sign_array.size() != connection_count || connection_cost_array.size() != connection_count || connection_level_array.size() != connection_count || connection_key_array.size() != connection_count || connection_start_node_array.size() != connection_count || connection_end_node_array.size() != connection_count, result, "The graph's connection arrays must all be the same size.");
+	ERR_FAIL_COND_V_MSG(!connection_group_array.is_empty() && connection_group_array.size() != connection_count, result, "connection_group must be empty or the same size as the other connection arrays.");
 	ERR_FAIL_COND_V_MSG(node_is_climb_array.size() != node_count || node_connection_begin_array.size() != node_count + 1, result, "The graph's node arrays must all be the same size, with one extra trailing entry in node_connection_begin.");
 	ERR_FAIL_COND_V_MSG(p_start_node < 0 || p_start_node >= node_count || p_goal_node < 0 || p_goal_node >= node_count, result, "The start and goal nodes must be in the graph.");
 
@@ -167,6 +169,7 @@ Dictionary PathSearch::find_path(const Dictionary &p_graph, int p_start_node, in
 	const int32_t *connection_key = connection_key_array.ptr();
 	const int32_t *connection_start_node = connection_start_node_array.ptr();
 	const int32_t *connection_end_node = connection_end_node_array.ptr();
+	const uint8_t *connection_group = connection_group_array.is_empty() ? nullptr : connection_group_array.ptr();
 	const uint8_t *node_active = node_active_array.ptr();
 	const uint8_t *node_is_climb = node_is_climb_array.ptr();
 	const int32_t *node_connection_begin = node_connection_begin_array.ptr();
@@ -183,6 +186,24 @@ Dictionary PathSearch::find_path(const Dictionary &p_graph, int p_start_node, in
 	}
 	for (int connection = 0; connection < connection_count; connection++) {
 		ERR_FAIL_COND_V_MSG(connection_start_node[connection] < 0 || connection_start_node[connection] >= node_count || connection_end_node[connection] < 0 || connection_end_node[connection] >= node_count, result, "A connection starts or ends at a node outside the graph.");
+	}
+
+	// Each group's multiplier on the own cost of its connections, indexed by group id. The caller's table may be
+	// shorter than the id range, and ids past its end keep a multiplier of 1, so it's spread over a full table here.
+	// Left null when nothing gets multiplied, so the search adds the plain connection cost exactly as without groups.
+	const PackedFloat64Array group_cost_mult_array = p_costs.get("group_cost_mult", PackedFloat64Array());
+	const double *group_cost_mult_values = group_cost_mult_array.ptr();
+	const int group_cost_mult_count = group_cost_mult_array.size();
+	for (int group = 0; group < group_cost_mult_count; group++) {
+		ERR_FAIL_COND_V_MSG(!Math::is_finite(group_cost_mult_values[group]) || group_cost_mult_values[group] < 0.0, result, "group_cost_mult must hold only finite multipliers of 0 or more.");
+	}
+	double group_cost_mult_table[UINT8_MAX + 1];
+	const double *group_cost_mult = nullptr;
+	if (connection_group && group_cost_mult_count > 0) {
+		for (int group = 0; group <= UINT8_MAX; group++) {
+			group_cost_mult_table[group] = group < group_cost_mult_count ? group_cost_mult_values[group] : 1.0;
+		}
+		group_cost_mult = group_cost_mult_table;
 	}
 
 	if (p_start_node == p_goal_node) {
@@ -313,7 +334,13 @@ Dictionary PathSearch::find_path(const Dictionary &p_graph, int p_start_node, in
 				walk_distance += Math::abs((double)current_landing.y - (double)new_position.y) * climb_vertical_mult;
 			}
 
-			const double new_cost = current_cost + walk_distance * walk_cost_per_unit + connection_cost[new_id];
+			// The connection's own cost, scaled by its group's multiplier.
+			double own_cost = connection_cost[new_id];
+			if (group_cost_mult) {
+				own_cost *= group_cost_mult[connection_group[new_id]];
+			}
+
+			const double new_cost = current_cost + walk_distance * walk_cost_per_unit + own_cost;
 
 			// Heuristic: distance from this connection's landing point to the goal, horizontal in full and vertical
 			// scaled by whether the goal is above or below.
