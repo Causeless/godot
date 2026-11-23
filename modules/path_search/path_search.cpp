@@ -35,9 +35,14 @@
 
 #include <limits>
 
-static double _get_cost(const Dictionary &p_costs, const char *p_key, double p_default) {
+// Reads a required entry of the costs dictionary into r_value, returning false if it's missing.
+static bool _get_cost(const Dictionary &p_costs, const char *p_key, double &r_value) {
 	const Variant *value = p_costs.getptr(String(p_key));
-	return value ? (double)(*value) : p_default;
+	if (!value) {
+		return false;
+	}
+	r_value = *value;
+	return true;
 }
 
 // Min-heap of connection ids keyed by cost, in two parallel vectors so that pushing and popping never allocate once
@@ -149,14 +154,14 @@ Dictionary PathSearch::find_path(const Dictionary &p_graph, int p_start_node, in
 	const PackedByteArray connection_group_array = p_graph.get("connection_group", PackedByteArray());
 	const PackedByteArray node_active_array = p_graph.get("node_active", PackedByteArray());
 	const PackedByteArray node_is_climb_array = p_graph.get("node_is_climb", PackedByteArray());
+	const PackedFloat32Array node_walk_mult_array = p_graph.get("node_walk_mult", PackedFloat32Array());
 	const PackedInt32Array node_connection_begin_array = p_graph.get("node_connection_begin", PackedInt32Array());
 	const PackedInt32Array node_connection_ids_array = p_graph.get("node_connection_ids", PackedInt32Array());
 
 	const int connection_count = connection_flags_array.size();
 	const int node_count = node_active_array.size();
-	ERR_FAIL_COND_V_MSG(connection_position_array.size() != connection_count || connection_landing_array.size() != connection_count || connection_runup_x_array.size() != connection_count || connection_runup_sign_array.size() != connection_count || connection_cost_array.size() != connection_count || connection_level_array.size() != connection_count || connection_key_array.size() != connection_count || connection_start_node_array.size() != connection_count || connection_end_node_array.size() != connection_count, result, "The graph's connection arrays must all be the same size.");
-	ERR_FAIL_COND_V_MSG(!connection_group_array.is_empty() && connection_group_array.size() != connection_count, result, "connection_group must be empty or the same size as the other connection arrays.");
-	ERR_FAIL_COND_V_MSG(node_is_climb_array.size() != node_count || node_connection_begin_array.size() != node_count + 1, result, "The graph's node arrays must all be the same size, with one extra trailing entry in node_connection_begin.");
+	ERR_FAIL_COND_V_MSG(connection_position_array.size() != connection_count || connection_landing_array.size() != connection_count || connection_runup_x_array.size() != connection_count || connection_runup_sign_array.size() != connection_count || connection_cost_array.size() != connection_count || connection_level_array.size() != connection_count || connection_key_array.size() != connection_count || connection_start_node_array.size() != connection_count || connection_end_node_array.size() != connection_count || connection_group_array.size() != connection_count, result, "The graph's connection arrays must all be the same size.");
+	ERR_FAIL_COND_V_MSG(node_is_climb_array.size() != node_count || node_walk_mult_array.size() != node_count || node_connection_begin_array.size() != node_count + 1, result, "The graph's node arrays must all be the same size, with one extra trailing entry in node_connection_begin.");
 	ERR_FAIL_COND_V_MSG(p_start_node < 0 || p_start_node >= node_count || p_goal_node < 0 || p_goal_node >= node_count, result, "The start and goal nodes must be in the graph.");
 
 	const Vector2 *connection_position = connection_position_array.ptr();
@@ -169,52 +174,47 @@ Dictionary PathSearch::find_path(const Dictionary &p_graph, int p_start_node, in
 	const int32_t *connection_key = connection_key_array.ptr();
 	const int32_t *connection_start_node = connection_start_node_array.ptr();
 	const int32_t *connection_end_node = connection_end_node_array.ptr();
-	const uint8_t *connection_group = connection_group_array.is_empty() ? nullptr : connection_group_array.ptr();
+	const uint8_t *connection_group = connection_group_array.ptr();
 	const uint8_t *node_active = node_active_array.ptr();
 	const uint8_t *node_is_climb = node_is_climb_array.ptr();
+	const float *node_walk_mult = node_walk_mult_array.ptr();
 	const int32_t *node_connection_begin = node_connection_begin_array.ptr();
 	const int32_t *node_connection_ids = node_connection_ids_array.ptr();
+
+	// Each group's multiplier on the own cost of its connections, indexed by group id. It has to cover every group id
+	// the graph uses, which is checked with the connections below.
+	const PackedFloat64Array group_cost_mult_array = p_costs.get("group_cost_mult", PackedFloat64Array());
+	const double *group_cost_mult = group_cost_mult_array.ptr();
+	const int group_cost_mult_count = group_cost_mult_array.size();
+	for (int group = 0; group < group_cost_mult_count; group++) {
+		ERR_FAIL_COND_V_MSG(!Math::is_finite(group_cost_mult[group]) || group_cost_mult[group] < 0.0, result, "group_cost_mult must hold only finite multipliers of 0 or more.");
+	}
+
+	double walk_cost_per_unit = 0.0; // What a unit of horizontal distance walked between connections costs.
+	double heuristic_per_unit = 0.0; // What a unit of straight-line distance still to the goal counts for. More than walk_cost_per_unit trades path quality for fewer iterations.
+	double climb_vertical_mult = 0.0; // On a climb node, how many walked units a unit of height to the connection counts as.
+	double heuristic_up_mult = 0.0; // How much a unit of height still to climb to the goal counts in the heuristic.
+	double heuristic_down_mult = 0.0; // How much a unit of height still to drop to the goal counts in the heuristic.
+	ERR_FAIL_COND_V_MSG(!_get_cost(p_costs, "walk_cost_per_unit", walk_cost_per_unit) || !_get_cost(p_costs, "heuristic_per_unit", heuristic_per_unit) || !_get_cost(p_costs, "climb_vertical_mult", climb_vertical_mult) || !_get_cost(p_costs, "heuristic_up_mult", heuristic_up_mult) || !_get_cost(p_costs, "heuristic_down_mult", heuristic_down_mult), result, "costs must hold walk_cost_per_unit, heuristic_per_unit, climb_vertical_mult, heuristic_up_mult and heuristic_down_mult.");
 
 	// Every index the search follows is checked here, so the loop below needs no bounds checks.
 	const int node_connection_ids_count = node_connection_ids_array.size();
 	ERR_FAIL_COND_V_MSG(node_connection_begin[0] != 0 || node_connection_begin[node_count] != node_connection_ids_count, result, "node_connection_begin must start at 0 and end at the size of node_connection_ids.");
 	for (int node = 0; node < node_count; node++) {
 		ERR_FAIL_COND_V_MSG(node_connection_begin[node] > node_connection_begin[node + 1], result, "node_connection_begin must not decrease.");
+		ERR_FAIL_COND_V_MSG(!Math::is_finite(node_walk_mult[node]) || node_walk_mult[node] < 0.0f, result, "node_walk_mult must hold only finite multipliers of 0 or more.");
 	}
 	for (int i = 0; i < node_connection_ids_count; i++) {
 		ERR_FAIL_COND_V_MSG(node_connection_ids[i] < 0 || node_connection_ids[i] >= connection_count, result, "node_connection_ids holds a connection id outside the graph.");
 	}
 	for (int connection = 0; connection < connection_count; connection++) {
 		ERR_FAIL_COND_V_MSG(connection_start_node[connection] < 0 || connection_start_node[connection] >= node_count || connection_end_node[connection] < 0 || connection_end_node[connection] >= node_count, result, "A connection starts or ends at a node outside the graph.");
-	}
-
-	// Each group's multiplier on the own cost of its connections, indexed by group id. The caller's table may be
-	// shorter than the id range, and ids past its end keep a multiplier of 1, so it's spread over a full table here.
-	// Left null when nothing gets multiplied, so the search adds the plain connection cost exactly as without groups.
-	const PackedFloat64Array group_cost_mult_array = p_costs.get("group_cost_mult", PackedFloat64Array());
-	const double *group_cost_mult_values = group_cost_mult_array.ptr();
-	const int group_cost_mult_count = group_cost_mult_array.size();
-	for (int group = 0; group < group_cost_mult_count; group++) {
-		ERR_FAIL_COND_V_MSG(!Math::is_finite(group_cost_mult_values[group]) || group_cost_mult_values[group] < 0.0, result, "group_cost_mult must hold only finite multipliers of 0 or more.");
-	}
-	double group_cost_mult_table[UINT8_MAX + 1];
-	const double *group_cost_mult = nullptr;
-	if (connection_group && group_cost_mult_count > 0) {
-		for (int group = 0; group <= UINT8_MAX; group++) {
-			group_cost_mult_table[group] = group < group_cost_mult_count ? group_cost_mult_values[group] : 1.0;
-		}
-		group_cost_mult = group_cost_mult_table;
+		ERR_FAIL_COND_V_MSG(connection_group[connection] >= group_cost_mult_count, result, "A connection's group has no entry in group_cost_mult.");
 	}
 
 	if (p_start_node == p_goal_node) {
 		return result;
 	}
-
-	const double walk_cost_per_unit = _get_cost(p_costs, "walk_cost_per_unit", 1.0); // What a unit of horizontal distance walked between connections costs.
-	const double heuristic_per_unit = _get_cost(p_costs, "heuristic_per_unit", 1.0); // What a unit of straight-line distance still to the goal counts for. More than walk_cost_per_unit trades path quality for fewer iterations.
-	const double climb_vertical_mult = _get_cost(p_costs, "climb_vertical_mult", 1.0); // On a climb node, how many walked units a unit of height to the connection counts as.
-	const double heuristic_up_mult = _get_cost(p_costs, "heuristic_up_mult", 1.0); // How much a unit of height still to climb to the goal counts in the heuristic.
-	const double heuristic_down_mult = _get_cost(p_costs, "heuristic_down_mult", 1.0); // How much a unit of height still to drop to the goal counts in the heuristic.
 
 	// The virtual start connection, see above.
 	const int32_t start_id = connection_count;
@@ -284,10 +284,17 @@ Dictionary PathSearch::find_path(const Dictionary &p_graph, int p_start_node, in
 			continue;
 		}
 
+		// Everything about the current node the inner loop needs, read once here. The loop writes to memory and can
+		// grow the frontier, so the compiler can't prove the arrays behind these unchanged and would reread them for
+		// every connection.
 		const double current_cost = cost_so_far[current_id];
 		const double current_x = current_landing.x;
+		const double current_y = current_landing.y;
+		const bool current_is_climb = node_is_climb[current_node];
+		const double current_walk_cost_per_unit = walk_cost_per_unit * node_walk_mult[current_node];
+		const int32_t connection_index_end = node_connection_begin[current_node + 1];
 
-		for (int32_t index = node_connection_begin[current_node]; index < node_connection_begin[current_node + 1]; index++) {
+		for (int32_t index = node_connection_begin[current_node]; index < connection_index_end; index++) {
 			const int32_t new_id = node_connection_ids[index];
 			edges_evaluated++;
 			const int32_t new_end_node = connection_end_node[new_id];
@@ -330,17 +337,14 @@ Dictionary PathSearch::find_path(const Dictionary &p_graph, int p_start_node, in
 			}
 
 			// On a climb node, reaching the connection also means climbing to its height.
-			if (node_is_climb[current_node]) {
-				walk_distance += Math::abs((double)current_landing.y - (double)new_position.y) * climb_vertical_mult;
+			if (current_is_climb) {
+				walk_distance += Math::abs(current_y - (double)new_position.y) * climb_vertical_mult;
 			}
 
-			// The connection's own cost, scaled by its group's multiplier.
-			double own_cost = connection_cost[new_id];
-			if (group_cost_mult) {
-				own_cost *= group_cost_mult[connection_group[new_id]];
-			}
-
-			const double new_cost = current_cost + walk_distance * walk_cost_per_unit + own_cost;
+			// The walk is priced at the current node's rate, and the connection's own cost scaled by its group's
+			// multiplier.
+			const double own_cost = connection_cost[new_id] * group_cost_mult[connection_group[new_id]];
+			const double new_cost = current_cost + walk_distance * current_walk_cost_per_unit + own_cost;
 
 			// Heuristic: distance from this connection's landing point to the goal, horizontal in full and vertical
 			// scaled by whether the goal is above or below.
